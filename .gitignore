@@ -1,0 +1,15 @@
+# Escludi file di testo con i risultati (spesso diventano pesanti)
+*.txt
+*.log
+*.png
+*.pth
+*.pdf
+*.json
+*.wandb
+
+
+# Escludi cartelle di sistema di Python
+__pycache__/
+**/wandb/
+*.pyc
+
