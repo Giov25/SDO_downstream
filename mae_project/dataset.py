@@ -443,6 +443,8 @@ class SDO_Dataset_channels(Dataset):
         return tensor
 
 class SDO_Dataset_channels_FAST(Dataset):
+    
+    #img_data = np.nan_to_num(img_data, nan=-5000)
     def __init__(self, zarr_path, list_year, wavelengths, target_size, transform=None):
         self.z = zarr.open(zarr_path, mode='r')
         self.list_year = list_year
@@ -466,14 +468,24 @@ class SDO_Dataset_channels_FAST(Dataset):
     def __getitem__(self, idx):
         year, local_idx = self.indices[idx]
         
-        # Carica tutte le immagini in una volta
-        imgs = [self.z[year][wl][local_idx] for wl in self.wavelengths]
+        imgs = []
+        for wl in self.wavelengths:
+            img_data = self.z[year][wl][local_idx]
+            
+            # --- MODIFICA RICHIESTA ---
+            # Se la lunghezza d'onda è il magnetogramma, gestisci i NaN
+            if str(wl) == 'Magnetogram': 
+                img_data = np.nan_to_num(img_data, nan=-5000)
+            # ---------------------------
+            
+            imgs.append(img_data)
         
         # Normalizzazione semplice 0-1
         for i, img in enumerate(imgs):
             p_low, p_high = np.percentile(img, [2.5, 99.5])
             #img_min, img_max = img.min(), img.max()
             imgs[i] = (img - p_low) / (p_high - p_low)
+            
         
         # Stack e resize
         stacked = np.stack(imgs, axis=0)

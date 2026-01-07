@@ -19,6 +19,98 @@ import random
 from sklearn.model_selection import train_test_split
 
 
+class SDO_9Channel_Dataset(Dataset):
+    def __init__(self, zarr_path, list_year, wavelengths, target_size=512, transform=None, num_classes=1):
+        """
+        Args:
+            zarr_path (str): Path al file Zarr.
+            list_year (list): Anni da includere (es. ['2014', '2015']).
+            wavelengths (list): Lista dei 9 canali AIA.
+            target_size (int): Dimensione finale dell'immagine (H, W).
+            transform (callable, optional): Trasformazioni da applicare al dizionario batch.
+            num_classes (int): 1 per regressione/binary mask, 2 per CrossEntropy.
+        """
+        self.z = zarr.open(zarr_path, mode='r')
+        self.list_year = [str(y) for y in list_year]
+        self.wavelengths = wavelengths # Assicurati siano i 9 canali AIA
+        self.target_size = target_size
+        self.transform = transform
+        self.num_classes = num_classes
+        
+        # Pre-calcolo degli indici per accesso immediato O(1)
+        self.indices = []
+        for year in self.list_year:
+            # Calcoliamo il numero di campioni sincronizzati per quell'anno
+            # Consideriamo sia i canali AIA che Ic_noLimbDark
+            available_channels = self.wavelengths + ["Ic_noLimbDark"]
+            count = min(self.z[year][wl].shape[0] for wl in available_channels)
+            
+            for local_idx in range(count):
+                self.indices.append((year, local_idx))
+        
+        self.N = len(self.indices)
+
+    def __len__(self):
+        return self.N
+
+    def __getitem__(self, idx):
+        year, local_idx = self.indices[idx]
+        
+        # 1. Caricamento e Normalizzazione dei 9 canali AIA
+        aia_imgs = []
+        for wl in self.wavelengths:
+            img = self.z[year][wl][local_idx].astype(np.float32)
+            
+            # Normalizzazione Robust Percentile (2.5% - 99.5%)
+            p_low, p_high = np.percentile(img, [2.5, 99.5])
+            img = np.clip(img, p_low, p_high)
+            img = (img - p_low) / (p_high - p_low + 1e-6)
+            
+            aia_imgs.append(img)
+            
+        # Stack dei 9 canali: [9, H, W]
+        aia_stack = np.stack(aia_imgs, axis=0)
+        
+        # 2. Gestione Ic_noLimbDark e Maschera
+        ic_img = self.z[year]["Ic_noLimbDark"][local_idx].astype(np.float32)
+        
+        # Generazione maschera (assumendo che clv_correction sia definita globalmente)
+        # Se clv_correction non è disponibile, sostituisci con la tua logica di soglia
+        mask = clv_correction(ic_img) 
+        
+        # 3. Resize se l'immagine nel Zarr non è già del target_size
+        # Usiamo zoom solo se necessario (operazione costosa)
+        current_h, current_w = aia_stack.shape[1], aia_stack.shape[2]
+        if current_h != self.target_size or current_w != self.target_size:
+            scale = self.target_size / current_h
+            # Resize AIA (Order 1 o 3 per qualità)
+            aia_stack = zoom(aia_stack, (1, scale, scale), order=1)
+            # Resize Maschera (Order 0 per preservare labels)
+            mask = zoom(mask.astype(np.float32), (scale, scale), order=0)
+            # Resize IC originale
+            ic_img = zoom(ic_img, (scale, scale), order=1)
+
+        # 4. Conversione in Tensori
+        image_tensor = torch.from_numpy(aia_stack).float()
+        
+        if self.num_classes == 1:
+            mask_tensor = torch.from_numpy(mask).float().unsqueeze(0) # [1, H, W]
+        else:
+            mask_tensor = torch.from_numpy(mask).long().unsqueeze(0)  # [1, H, W]
+            
+        ic_tensor = torch.from_numpy(ic_img).float().unsqueeze(0) # [1, H, W]
+
+        batch = {
+            'image': image_tensor,           # [9, H, W]
+            'mask': mask_tensor,             # [1, H, W]
+            'ic_no_limb_dark': ic_tensor     # [1, H, W]
+        }
+
+        if self.transform:
+            batch = self.transform(batch)
+
+        return batch
+
 
 # def compute_limb_darkening(image, a=0.3, b=0.1, solar_radius_arcsec=960, pixel_scale=0.5):
 #     ny, nx = image.shape

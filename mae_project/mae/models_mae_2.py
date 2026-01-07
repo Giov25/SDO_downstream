@@ -109,7 +109,7 @@ class MaskedAutoencoderViT(nn.Module):
         self.num_patches = num_patches
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim), requires_grad=False)  # fixed sin-cos embedding
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim), requires_grad=True)  # fixed sin-cos embedding
 
         self.blocks = nn.ModuleList([
             Block(embed_dim, num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer)
@@ -123,7 +123,7 @@ class MaskedAutoencoderViT(nn.Module):
 
         self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
 
-        self.decoder_pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, decoder_embed_dim), requires_grad=False)  # fixed sin-cos embedding
+        self.decoder_pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, decoder_embed_dim), requires_grad=True)  # fixed sin-cos embedding
 
         self.decoder_blocks = nn.ModuleList([
             Block(decoder_embed_dim, decoder_num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer)
@@ -152,15 +152,11 @@ class MaskedAutoencoderViT(nn.Module):
         self.initialize_weights()
 
     def initialize_weights(self):
-        # initialization
-        # initialize (and freeze) pos_embed by sin-cos embedding
-        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.patch_embed.num_patches**.5), cls_token=True)
-        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+        # Inizializzazione allenabile invece di sin-cos fisso
+        torch.nn.init.trunc_normal_(self.pos_embed, std=.02)
+        torch.nn.init.trunc_normal_(self.decoder_pos_embed, std=.02)
 
-        decoder_pos_embed = get_2d_sincos_pos_embed(self.decoder_pos_embed.shape[-1], int(self.patch_embed.num_patches**.5), cls_token=True)
-        self.decoder_pos_embed.data.copy_(torch.from_numpy(decoder_pos_embed).float().unsqueeze(0))
-
-        # initialize patch_embed like nn.Linear (instead of nn.Conv2d)
+        # Resto dell'inizializzazione (patch_embed, cls_token, ecc.)
         w = self.patch_embed.proj.weight.data
         torch.nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
 
@@ -449,67 +445,14 @@ def mae_model_for_pretraining(**kwargs):            #random masking
         mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), grid_size=3, mask_mode='spatial') 
     return model
 
-
-def mae_for_segmentation_14(**kwargs):           #no image masking
-    """ MAE model for segmentation with no image masking
-    """
-    model = MaskedAutoencoderViT(
-        img_size=672, patch_size=14, embed_dim=768, depth=12, num_heads=12, n_img_mask=0,
-        decoder_embed_dim=512, decoder_depth=8, decoder_num_heads=16, in_chans=3,
-        mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), grid_size=3, mask_mode='spatial')
-    return model
-
-def mae_for_segmentation_7(**kwargs):           #no image masking
-    """ MAE model for segmentation with no image masking
-    """
-    model = MaskedAutoencoderViT(
-        img_size=672, patch_size=7, embed_dim=768, depth=12, num_heads=12, n_img_mask=0,
-        decoder_embed_dim=512, decoder_depth=8, decoder_num_heads=16, in_chans=3,
-        mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), grid_size=3, mask_mode='spatial')
-    return model
-
-
-def mae_model_channel_masking(**kwargs):
-    """ MAE model for pretraining with channel masking
-    """
-    model = MaskedAutoencoderViT(
-        img_size=672, patch_size=14, embed_dim=768, depth=12, num_heads=12, n_img_mask=None,
-        decoder_embed_dim=512, decoder_depth=8, decoder_num_heads=16, in_chans=3,
-        mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), grid_size=3, 
-        mask_mode='channel', use_channel_attention=False)
-    return model
-
-
-def mae_model_channel_masking_9ch(**kwargs):
-    """ MAE model for pretraining with channel masking for 9 channels
-    """
-    model = MaskedAutoencoderViT(
-        img_size=512, patch_size=8, embed_dim=768, depth=12, num_heads=12, n_img_mask=None,
-        decoder_embed_dim=512, decoder_depth=8, decoder_num_heads=16, in_chans=9,
-        mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), grid_size=2, 
-        mask_mode='channel', use_channel_attention=False)
-    return model
-
-
-def mae_model_channel_masking_with_temporal_attn(**kwargs):
-    """ MAE model with channel masking AND cross-channel attention
-    """
-    model = MaskedAutoencoderViT(
-        img_size=672, patch_size=14, embed_dim=768, depth=12, num_heads=12, n_img_mask=None,
-        decoder_embed_dim=512, decoder_depth=8, decoder_num_heads=16, in_chans=3,
-        mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), grid_size=3, 
-        mask_mode='channel', use_channel_attention=True, num_channel_attn_blocks=2)
-    return model
-
-
 def mae_model_channel_masking_9ch_with_temporal_attn(**kwargs):
     """ MAE model with 9 channels, channel masking AND cross-channel attention
     Questo modello usa attenzione temporale per catturare correlazioni tra i canali NON mascherati
     """
     model = MaskedAutoencoderViT(
-        img_size=512, patch_size=8, embed_dim=768, depth=12, num_heads=12, n_img_mask=None,
+        img_size=1024, patch_size=16, embed_dim=768, depth=12, num_heads=12, n_img_mask=None,
         decoder_embed_dim=512, decoder_depth=8, decoder_num_heads=16, in_chans=9,
-        mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), grid_size=2, 
+        mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), norm_pix_loss=False, grid_size=2, 
         mask_mode='channel', use_channel_attention=True, num_channel_attn_blocks=3)
     return model
 

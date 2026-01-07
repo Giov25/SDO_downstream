@@ -21,7 +21,7 @@ def get_args():
     parser = argparse.ArgumentParser(description="SDO Segmentation Training and Inference")
     
     # Mode selection
-    parser.add_argument('--mode', type=str, choices=['train', 'test'], required=True, 
+    parser.add_argument('--mode', type=str, choices=['train', 'test', 'resume'], required=True, 
                         help="Run mode: 'train' to start training, 'test' to run inference.")
     
     # Paths
@@ -69,7 +69,7 @@ def main():
     val_years   = list(range(2021, 2023))
     test_years  = list(range(2023, 2026))
 
-    if args.mode == 'train':
+    if args.mode != 'test':
         train_ds = SDO_9Channel_Dataset(args.zarr_path, train_years, wavelengths, target_size=args.image_size)
         val_ds = SDO_9Channel_Dataset(args.zarr_path, val_years, wavelengths, target_size=args.image_size)
         
@@ -88,7 +88,7 @@ def main():
     model = setup_model(args, device)
 
     # --- Execution ---
-    if args.mode == 'train':
+    if args.mode != 'test':
         print("Starting Training Mode...")
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
         criterion = DiceCELoss(to_onehot_y=True, softmax=True, lambda_dice=1.5, lambda_ce=1.0, include_background=False)
@@ -134,23 +134,46 @@ def main():
                 # ... altri parametri
             }
         )
-        
-        train_model(
-            model=model,
-            num_epochs=args.epochs,
-            train_loader=train_loader,
-            test_loader=val_loader, # Usa validation loader invece di test
-            optimizer=optimizer,
-            device=device,
-            criterion=criterion,
-            scheduler=scheduler,
-            dice_metric=dice_metric, # Funzione di dice corretta
-            post_pred=post_pred,
-            post_label=post_label,
-            model_save_path=args.model_path,
-            wandb_run=run, # Passa wandb run per logging
-            max_grad_norm=1.0 # Gradient clipping
-            )
+        if args.mode == 'resume':
+            print(f"Resuming training from checkpoint: {args.model_path}")
+            checkpoint = torch.load(args.model_path, map_location=device, weights_only=False)
+            # Handle cases where checkpoint is a dict or a direct state_dict
+            state_dict = checkpoint["model_state_dict"] if "model_state_dict" in checkpoint else checkpoint
+            model.load_state_dict(state_dict)        
+            train_model(
+                model=model,
+                num_epochs=args.epochs,
+                train_loader=train_loader,
+                test_loader=val_loader, # Usa validation loader invece di test
+                optimizer=optimizer,
+                device=device,
+                criterion=criterion,
+                scheduler=scheduler,
+                dice_metric=dice_metric, # Funzione di dice corretta
+                post_pred=post_pred,
+                post_label=post_label,
+                model_save_path=args.model_path,
+                wandb_run=run, # Passa wandb run per logging
+                max_grad_norm=1.0 # Gradient clipping
+                )
+            
+        else:
+            train_model(
+                model=model,
+                num_epochs=args.epochs,
+                train_loader=train_loader,
+                test_loader=val_loader, # Usa validation loader invece di test
+                optimizer=optimizer,
+                device=device,
+                criterion=criterion,
+                scheduler=scheduler,
+                dice_metric=dice_metric, # Funzione di dice corretta
+                post_pred=post_pred,
+                post_label=post_label,
+                model_save_path=args.model_path,
+                wandb_run=run, # Passa wandb run per logging
+                max_grad_norm=1.0 # Gradient clipping
+                )
 
 
 

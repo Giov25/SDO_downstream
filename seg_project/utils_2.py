@@ -343,7 +343,7 @@ def predict_and_plot(model, loader, device, post_pred, post_label, dice_metric):
 
     return outputs, labels
         
-
+import os
 def train_model(model, 
                 num_epochs, 
                 train_loader, 
@@ -398,6 +398,7 @@ def train_model(model,
         if val_metric > max_validation:
             max_validation = val_metric
             if model_save_path:
+                os.makedirs(os.path.dirname(model_save_path), exist_ok=True)
                 torch.save({
                     'epoch': epoch + 1,
                     'model_state_dict': model.state_dict(),
@@ -426,6 +427,7 @@ def train_model(model,
         val_dice_scores.append(val_metric)
 
         print(f'  Train Loss: {np.mean(train_losses):.4f} | Val Loss: {np.mean(val_losses):.4f} | Val Dice: {np.mean(val_dice_scores):.4f} | LR: {current_lr:.2e} | Time: {epoch_time:.1f}s')
+        print(f'  Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val Dice: {val_metric:.4f} | LR: {current_lr:.2e} | Time: {epoch_time:.1f}s')
         print(f'  Best Dice so far: {max_validation:.4f}')
         print("-" * 80)
     # salva l'ultimo checkpoint
@@ -441,4 +443,104 @@ def train_model(model,
         }, model_save_path)
     return train_losses, val_losses, val_dice_scores
 
+def test_and_plot(model, dataloader, device, n_images=6, threshold=0.5, use_wandb=False, save_path=None):
+    """
+    Esegue il modello e plotta:
+      - riga 1: input del modello
+      - riga 2: ground truth (overlay rosso) su gt_image
+      - riga 3: predizione (overlay blu) su gt_image
+
+    Args:
+        model: modello PyTorch
+        dataloader: DataLoader (deve fornire un dizionario con 'image', 'mask', e 'gt_image')
+        device: torch device
+        n_images: numero di esempi da mostrare
+        threshold: soglia per binarizzare la predizione (binary)
+        use_wandb: se True, logga le immagini su wandb
+        save_path: se fornito, salva la figura in questo path
+    Returns:
+        dice_list: lista dei Dice score per immagine
+        mean_dice: Dice score medio
+    """
+    model.eval()
+    batch = next(iter(dataloader))
+    inputs = batch['image']      # Immagine di input per il modello
+    labels = batch['mask']       # Maschera di ground truth
+    # --- MODIFICA 1: Estrai l'immagine di sfondo per gli overlay ---
+    gt_images = batch['ic_no_limb_dark'] # Immagine di sfondo per visualizzazione
+
+    batch_size = inputs.shape[0]
+    n_show = min(n_images, batch_size)
+
+    dice_list = []
+
+    with torch.no_grad():
+        outputs = model(inputs.to(device))
+
+        if outputs.dim() >= 4 and outputs.shape[1] > 1:
+            probs = torch.softmax(outputs, dim=1)
+            preds = torch.argmax(probs, dim=1, keepdim=True).float()
+        else:
+            probs = torch.sigmoid(outputs)
+            preds = (probs > threshold).float()
+
+        fig, axes = plt.subplots(n_show, 3, figsize=(12, 4 * n_show))
+        if n_show == 1:
+            axes = axes.reshape(1, 3)
+
+        for i in range(n_show):
+            # Immagine di input (per la prima riga)
+            img_input = inputs[i, 0].cpu().numpy()
+            # Maschera di ground truth
+            gt_mask = labels[i, 0].cpu().numpy().astype(np.uint8)
+            # Predizione
+            pred_mask = preds[i].squeeze(0).cpu().numpy().astype(np.uint8)
+
+            # Immagine di sfondo per questo campione
+            background_img = gt_images[i, 0].cpu().numpy()
+
+            # Calcola il Dice score
+            dice_i = _dice_score_numpy(pred_mask, gt_mask)
+            dice_list.append(dice_i)
+
+            # Column 1: original input image (quello che vede il modello)
+            axes[i, 0].imshow(gt_mask, cmap='gray')
+            axes[i, 0].set_title(f'Input #{i+1}')
+            axes[i, 0].axis('off')
+
+            # Column 2: GT overlay on the background image
+            axes[i, 1].imshow(background_img, cmap='gray', alpha=0.8)
+            axes[i, 1].imshow(gt_mask, cmap='Reds', alpha=0.5, vmin=0, vmax=1)
+            axes[i, 1].set_title('Ground Truth')
+            axes[i, 1].axis('off')
+
+            # Column 3: Prediction overlay on the background image
+            axes[i, 2].imshow(background_img, cmap='gray', alpha=0.8)
+            axes[i, 2].imshow(pred_mask, cmap='Blues', alpha=0.5, vmin=0, vmax=1)
+            axes[i, 2].set_title(f'Prediction (Dice={dice_i:.3f})')
+            axes[i, 2].axis('off')
+
+    plt.tight_layout()
+    mean_dice = float(np.mean(dice_list)) if len(dice_list) > 0 else 0.0
+
+    if save_path:
+        plt.savefig(save_path, dpi=200, bbox_inches='tight')
+
+    try:
+        if use_wandb and 'wandb' in globals() and wandb.run is not None:
+            wandb.log({"test/predictions": wandb.Image(fig)})
+            wandb.log({"test/dice_per_image": dice_list, "test/dice_mean": mean_dice})
+    except Exception as e:
+        print(f"Warning: failed to log to wandb: {e}")
+
+    print("Per-image Dice:")
+    for idx, d in enumerate(dice_list, 1):
+        print(f"  Image {idx}: {d:.4f}")
+    print(f"Mean Dice (shown images): {mean_dice:.4f}")
+
+    plt.show()
+    plt.close(fig)
+
+
+    return dice_list, mean_dice
 

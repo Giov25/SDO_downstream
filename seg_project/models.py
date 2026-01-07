@@ -371,14 +371,15 @@ class DeepDecoder(nn.Module):
         nn.init.constant_(self.last_conv.bias, 0.1)
     
     def forward(self, grid_features):
-        # Input: [B, 768, H, W] dove H,W possono essere 12x12, 16x16, o 32x32
+        # Input: [B, 768, H, W] dove H,W possono essere 12x12, 16x16, 21x21, o 32x32
+        # Output: [B, num_classes, 512, 512]
         # Riduzione canali: [B, 768, H, W] -> [B, 512, H, W]
         B, C, H, W = grid_features.shape
         x = self.channel_reduction(grid_features)
         
 
         if H == 16 and W == 16:
-            # Input 16x16: percorso standard 16->32->64->128->224
+            # Input 16x16: percorso 16->32->64->128->256->512
             x = self.decoder_block1(x)  # [B, 256, 16, 16]
             x = self.upsample1(x)       # [B, 256, 32, 32]
             
@@ -389,11 +390,29 @@ class DeepDecoder(nn.Module):
             x = self.upsample3(x)       # [B, 64, 128, 128]
             
             x = self.decoder_block4(x)  # [B, 32, 128, 128]
-            x = self.upsample4(x)       # [B, 32, 224, 224]
+            x = self.upsample4(x)       # [B, 32, 256, 256]
+            
+            # Ulteriore upsampling 256->512
+            x = nn.functional.interpolate(x, size=(512, 512), mode='bilinear', align_corners=True)
+            
+        elif H == 21 and W == 21:
+            # Input 21x21: upsample per raggiungere 512
+            # 21 -> 64 -> 128 -> 256 -> 512
+            x = self.decoder_block1(x)  # [B, 256, 21, 21]
+            x = nn.functional.interpolate(x, size=(64, 64), mode='bilinear', align_corners=True)
+            
+            x = self.decoder_block2(x)  # [B, 128, 64, 64]
+            x = nn.functional.interpolate(x, size=(128, 128), mode='bilinear', align_corners=True)
+            
+            x = self.decoder_block3(x)  # [B, 64, 128, 128]
+            x = nn.functional.interpolate(x, size=(256, 256), mode='bilinear', align_corners=True)
+            
+            x = self.decoder_block4(x)  # [B, 32, 256, 256]
+            x = nn.functional.interpolate(x, size=(512, 512), mode='bilinear', align_corners=True)
             
         elif H == 32 and W == 32:
-            # Input 32x32: salta il primo upsampling, percorso 32->64->128->224
-            x = self.decoder_block1(x)  # [B, 256, 32, 32] (processa ma non upsampla)
+            # Input 32x32: percorso 32->64->128->256->512
+            x = self.decoder_block1(x)  # [B, 256, 32, 32]
             
             x = self.decoder_block2(x)  # [B, 128, 32, 32]
             x = self.upsample2(x)       # [B, 128, 64, 64]
@@ -402,16 +421,16 @@ class DeepDecoder(nn.Module):
             x = self.upsample3(x)       # [B, 64, 128, 128]
             
             x = self.decoder_block4(x)  # [B, 32, 128, 128]
-            x = self.upsample4(x)       # [B, 32, 224, 224]
+            x = nn.functional.interpolate(x, size=(512, 512), mode='bilinear', align_corners=True)
             
         else:
-            raise ValueError(f"Unsupported input spatial size: {H}x{W}. Supported sizes: 12x12, 16x16, or 32x32")
+            raise ValueError(f"Unsupported input spatial size: {H}x{W}. Supported sizes: 12x12, 16x16, 21x21, or 32x32")
         
         # Raffinamento finale
-        x = self.final_refinement(x)  # [B, 16, 224, 224]
+        x = self.final_refinement(x)  # [B, 16, 512, 512]
         
         # Output finale
-        x = self.last_conv(x)       # [B, num_classes, 224, 224]
+        x = self.last_conv(x)       # [B, num_classes, 512, 512]
         
         if self.out_sigmoid:
             x = self.sigmoid(x)
@@ -590,3 +609,168 @@ class MAESegmentationModel(nn.Module):
  
 
 
+####MODIFICHE APPORTATE 5/01/2026
+
+import torch
+import torch.nn as nn
+
+class PixelShuffleUpsample(nn.Module):
+    """Upsample usando PixelShuffle per ridurre gli artefatti 'checkerboard'"""
+    def __init__(self, in_channels, out_channels, upscale_factor=2):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels * (upscale_factor ** 2), kernel_size=3, padding=1)
+        self.pixel_shuffle = nn.PixelShuffle(upscale_factor)
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.pixel_shuffle(x)
+        x = self.bn(x)
+        return self.relu(x)
+
+class ImprovedDeepDecoder(nn.Module):
+    def __init__(self, num_classes=2, in_channels=768, dropout=0.1):
+        super().__init__()
+        
+        # 1. Riduzione iniziale
+        self.reduce = nn.Sequential(
+            nn.Conv2d(in_channels, 512, kernel_size=3, padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True)
+        )
+
+        # 2. Sequenza di Upsampling Progressivo (assumendo input 16x16)
+        # 16 -> 32
+        self.up1 = PixelShuffleUpsample(512, 256) 
+        # 32 -> 64
+        self.up2 = PixelShuffleUpsample(256, 128)
+        # 64 -> 128
+        self.up3 = PixelShuffleUpsample(128, 64)
+        # 128 -> 256
+        self.up4 = PixelShuffleUpsample(64, 32)
+        # 256 -> 512
+        self.up5 = PixelShuffleUpsample(32, 16)
+
+        self.final_head = nn.Sequential(
+            nn.Conv2d(16, 16, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, num_classes, kernel_size=1)
+        )
+
+    def forward(self, x):
+        # Se x è una sequenza di token [B, L, D], reshape in [B, D, H, W] prima
+        x = self.reduce(x)
+        
+        x = self.up1(x) # 32x32
+        x = self.up2(x) # 64x64
+        x = self.up3(x) # 128x128
+        x = self.up4(x) # 256x256
+        x = self.up5(x) # 512x512
+        
+        return self.final_head(x)
+    
+class MAEFeatureExtractor(nn.Module):
+    def __init__(self, mae_model):
+        super().__init__()
+        self.mae = mae_model
+        # Definiamo i layer da cui vogliamo estrarre le feature
+        # Se il MAE ha 12 blocchi, prendiamo i quarti
+        self.intermediate_layers = [2, 5, 8, 11] 
+
+    def forward(self, x):
+        x = self.mae.patch_embed(x)
+        # Aggiunge pos_embed escludendo il CLS se presente
+        if x.shape[1] == self.mae.pos_embed.shape[1] - 1:
+            x = x + self.mae.pos_embed[:, 1:, :]
+        else:
+            x = x + self.mae.pos_embed
+        
+        features = []
+        for i, blk in enumerate(self.mae.blocks):
+            x = blk(x)
+            if i in self.intermediate_layers:
+                features.append(x)
+        
+        B, L, C = features[0].shape
+        # Se L è dispari (es 1025), c'è il CLS token in posizione 0
+        has_cls = (L % 2 != 0)
+        H_p = W_p = int((L-1)**0.5) if has_cls else int(L**0.5)
+        
+        output_features = []
+        for f in features:
+            if has_cls:
+                f = f[:, 1:, :] # Rimuove il CLS token
+            f_2d = f.transpose(1, 2).reshape(B, C, H_p, W_p)
+            output_features.append(f_2d)
+                
+        return output_features
+    
+class UNetViTDecoder(nn.Module):
+    def __init__(self, num_classes=2, embed_dim=768):
+        super().__init__()
+        
+        # Blocchi di raffinamento per portare i token del MAE a dimensioni gestibili
+        self.refine4 = nn.Conv2d(embed_dim, 512, kernel_size=3, padding=1)
+        self.refine3 = nn.Conv2d(embed_dim, 256, kernel_size=3, padding=1)
+        self.refine2 = nn.Conv2d(embed_dim, 128, kernel_size=3, padding=1)
+        self.refine1 = nn.Conv2d(embed_dim, 64, kernel_size=3, padding=1)
+
+        # Upsampling progressivo (3 step per patch 8: 64->128, 128->256, 256->512)
+        self.up1 = PixelShuffleUpsample(512, 256)       # 64 -> 128
+        self.up2 = PixelShuffleUpsample(256 + 256, 128) # 128 -> 256 (in: up1 + refine3)
+        self.up3 = PixelShuffleUpsample(128 + 128, 64)  # 256 -> 512 (in: up2 + refine2)
+        
+        # Testa finale profonda
+        self.final_head = nn.Sequential(
+            nn.Conv2d(64 + 64, 64, kernel_size=3, padding=1), # 64 (up3) + 64 (refine1)
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, num_classes, kernel_size=1)
+        )
+
+    def forward(self, features):
+        # features sono tutti 64x64 (Patch 8 con input 512)
+        f1, f2, f3, f4 = features 
+
+        # 64 -> 128
+        x = self.refine4(f4)      
+        x = self.up1(x)           
+
+        # 128 (Concat con Layer 9)
+        s3 = self.refine3(f3)     
+        s3 = nn.functional.interpolate(s3, size=x.shape[2:], mode='bilinear')
+        x = torch.cat([x, s3], dim=1)
+        x = self.up2(x)           
+
+        # 256 (Concat con Layer 6)
+        s2 = self.refine2(f2)     
+        s2 = nn.functional.interpolate(s2, size=x.shape[2:], mode='bilinear')
+        x = torch.cat([x, s2], dim=1)
+        x = self.up3(x)           
+
+        # 512 (Concat finale con Layer 3)
+        s1 = self.refine1(f1)     
+        s1 = nn.functional.interpolate(s1, size=x.shape[2:], mode='bilinear')
+        x = torch.cat([x, s1], dim=1)
+        
+        # Output finale raffinato
+        return self.final_head(x)
+    
+    
+class MAE_UNet_Segmentation(nn.Module):
+    def __init__(self, mae_model, num_classes=2):
+        super().__init__()
+        self.encoder = MAEFeatureExtractor(mae_model)
+        # Assumendo embed_dim=768 per il MAE Base
+        self.decoder = UNetViTDecoder(num_classes=num_classes, embed_dim=768)
+
+    def forward(self, x):
+        # Estrae la lista di 4 feature map (layer 3, 6, 9, 12)
+        features = self.encoder(x)
+        # Il decoder fa skip-connection e upsampling fino a 512x512
+        mask = self.decoder(features)
+        return mask
