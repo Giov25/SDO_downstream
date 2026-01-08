@@ -446,13 +446,28 @@ def mae_model_for_pretraining(**kwargs):            #random masking
     return model
 
 def mae_model_channel_masking_9ch_with_temporal_attn(**kwargs):
-    """ MAE model with 9 channels, channel masking AND cross-channel attention
-    Questo modello usa attenzione temporale per catturare correlazioni tra i canali NON mascherati
-    """
-    model = MaskedAutoencoderViT(
-        img_size=1024, patch_size=16, embed_dim=768, depth=12, num_heads=12, n_img_mask=None,
-        decoder_embed_dim=512, decoder_depth=8, decoder_num_heads=16, in_chans=9,
-        mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), norm_pix_loss=False, grid_size=2, 
-        mask_mode='channel', use_channel_attention=True, num_channel_attn_blocks=3)
-    return model
+    # Estrai i parametri dai kwargs, usando i tuoi vecchi valori come default
+    img_size = kwargs.get('img_size', 1024)
+    patch_size = kwargs.get('patch_size', 16)
+    in_chans = kwargs.get('in_chans', 9)
 
+    model = MaskedAutoencoderViT(
+        img_size=img_size, 
+        patch_size=patch_size, 
+        embed_dim=768, 
+        depth=12, 
+        num_heads=12, 
+        n_img_mask=None,
+        decoder_embed_dim=512, 
+        decoder_depth=8, 
+        decoder_num_heads=16, 
+        in_chans=in_chans,
+        mlp_ratio=4, 
+        norm_layer=partial(nn.LayerNorm, eps=1e-6), 
+        norm_pix_loss=False, 
+        grid_size=2, 
+        mask_mode='channel', 
+        use_channel_attention=True, 
+        num_channel_attn_blocks=3
+    )
+    return model

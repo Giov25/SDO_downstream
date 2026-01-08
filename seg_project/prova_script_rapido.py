@@ -93,7 +93,7 @@ def main():
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
         criterion = DiceCELoss(to_onehot_y=True, softmax=True, lambda_dice=1.5, lambda_ce=1.0, include_background=False)
         dice_metric = DiceMetric(include_background=False, reduction="mean")
-        warmup_epochs = 5
+        warmup_epochs = 20
         warmup_scheduler = LinearLR(
             optimizer, 
             start_factor=0.1, 
@@ -123,7 +123,7 @@ def main():
         ]) 
         run = wandb.init(
             project="seg-sdo",           # Nome del progetto
-            name="esperimento-2",               # Nome del run (opzionale)
+            name="esperimento-dgx",               # Nome del run (opzionale)
             config={                            # Configurazione/hyperparameters
                 "learning_rate": args.lr,
                 "epochs": args.epochs,

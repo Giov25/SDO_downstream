@@ -1,220 +1,144 @@
-import matplotlib.pyplot as plt
-from IPython.display import clear_output
-from astropy.io import fits
-import warnings
-warnings.filterwarnings("ignore")
+import argparse
 import os
-import numpy as npmenom
-import matplotlib.pyplot as plt
-import sunpy
-from sunpy.map import Map
-import sys
-import os
-import requests
-import torch.nn as nn
+import random
 import torch
-import numpy as np
-import random
-import matplotlib.pyplot as plt
-from PIL import Image
-from torch import optim 
-#from utils import validate_one_epoch, run_one_image, show_image
-
+import torch.nn as nn
 from torch.utils.data import DataLoader
-
-
-torch.manual_seed(1)
 from functools import partial
-from mae.models_mae_2 import mae_model_channel_masking_9ch_with_temporal_attn
-from mae import models_mae_2
-from  torchvision.transforms import transforms
-
-
-from mae.MAE import new_mae_trial_small_patches
-from dataset import SDOMosaicZarrDataset, SDO_Dataset_channels
-
-device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
-
-from dataset import SDOMosaicZarrDataset, SDO_Dataset_channels, SDO_Dataset_channels_FAST
-import random
-random.seed(1)
-
-
-train_years = list(range(2011,2021))
-val_years   = list(range(2021,2023))
-#test_years  = list(range(2023,2026))
-image_size = 1024
-
-zarr_path = "/home/gpatane/Dataset/zarr_file_magnetogram.zarr"
-
-wavelengths = ['1700A', '1600A', '335A', '304A', '211A', '193A', '171A', '131A',  'Magnetogram']
-#['1700A', '1600A', '335A', '304A', '211A', '193A', '171A', '131A', '94A', 'Ic_noLimbDark', 'Magnetogram']
-
-
-train_dataset = SDO_Dataset_channels_FAST(zarr_path, train_years, wavelengths, target_size=image_size)
-validation_dataset = SDO_Dataset_channels_FAST(zarr_path, val_years, wavelengths, target_size=image_size)
-#test_dataset = SDO_Dataset_channels_FAST(zarr_path, test_years, wavelengths, target_size=image_size)
-
-train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True, num_workers=4)
-val_loader = DataLoader(validation_dataset, batch_size=1, shuffle=True, num_workers=4)
-#test_loader = DataLoader(test_dataset, batch_size=1, shuffle=True, num_workers=4)
-
-
-import wandb
-import os
 from tqdm import tqdm
+import wandb
 
-# Configurazione training
-num_epochs = 100
-save_every = 5
-checkpoint_dir = './checkpoints'
-os.makedirs(checkpoint_dir, exist_ok=True)
-model = mae_model_channel_masking_9ch_with_temporal_attn().to(device)
-lr = 1.5e-3
-scheduler_step_size = 20
-#steplr = 0.1
-scheduler = torch.optim.lr_scheduler.StepLR(optimizer=optim.AdamW(model.parameters(), lr=lr), step_size=scheduler_step_size, gamma=0.1)
-# Optimizer e scheduler
-optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.95), weight_decay=0.05)
-#scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
+# Import dal tuo progetto
+from mae.models_mae_2 import mae_model_channel_masking_9ch_with_temporal_attn
+from dataset import SDO_Dataset_channels_FAST
 
-
-# Inizializza wandb
-wandb.init(
-    project="mae-sdo",
-    name=f"mae_9channels_masking_{image_size}H100",
-    config={
-        "epochs": num_epochs,
-        "batch_size": train_loader.batch_size,
-        "learning_rate": lr,
-        "image_size": image_size,
-        "patch_size": model.patch_embed.patch_size[0],
-        "model": "MAE_ViT",
-        "channels": len(wavelengths),
-        "wavelengths": wavelengths
-    }
-)
-
-print(f"Starting training for {num_epochs} epochs...")
-print(f"Train samples: {len(train_dataset)}")
-print(f"Validation samples: {len(validation_dataset)}")
-print(f"Checkpoint directory: {checkpoint_dir}")
-
-
-# Training loop
-best_val_loss = float('inf')
-
-for epoch in range(num_epochs):
-    # ============ Training Phase ============
-    model.train()
-    train_loss = 0.0
-    train_batches = 0
+def get_args():
+    parser = argparse.ArgumentParser(description="Training script for SDO MAE")
     
-    pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]")
-    for batch in pbar:
-        batch = batch.to(device)
-        
-        # Forward pass
-        loss, pred, mask = model(batch)
-        
-        # Backward pass
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        
-        # Accumulate loss
-        train_loss += loss.item()
-        train_batches += 1
-        
-        # Update progress bar
-        pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+    # Path e Dataset
+    parser.add_argument("--zarr_path", type=str, default="/home/gpatane/Dataset/zarr_file_magnetogram.zarr", help="Path al file zarr")
+    parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints", help="Directory dove salvare i modelli")
+    parser.add_argument("--image_size", type=int, default=1024, help="Risoluzione immagine")
     
-    avg_train_loss = train_loss / train_batches
+    # Hyperparameters Training
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--lr", type=float, default=1.5e-3)
+    parser.add_argument("--weight_decay", type=float, default=0.05)
+    parser.add_argument("--save_every", type=int, default=5, help="Salva checkpoint ogni X epoche")
+    parser.add_argument("--seed", type=int, default=1)
     
-    # ============ Validation Phase ============
-    model.eval()
-    val_loss = 0.0
-    val_batches = 0
+    # Configurazione Modello
+    parser.add_argument("--patch_size", type=int, default=16)
+    parser.add_argument("--embed_dim", type=int, default=768)
+    parser.add_argument("--decoder_embed_dim", type=int, default=512)
     
-    with torch.no_grad():
-        pbar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Val]")
-        for batch in pbar:
-            batch = batch.to(device)
+    # Hardware
+    parser.add_argument("--device", type=str, default="cuda:4" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--num_workers", type=int, default=4)
+    
+    # WandB
+    parser.add_argument("--wandb_project", type=str, default="mae-sdo")
+    parser.add_argument("--wandb_run_name", type=str, default="mae_9channels_masking_DGX")
+
+    return parser.parse_args()
+
+def train():
+    args = get_args()
+    
+    # Set seeds
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(args.seed)
+
+    # Configurazione canali e anni
+    wavelengths = ['1700A', '1600A', '335A', '304A', '211A', '193A', '171A', '131A', 'Magnetogram']
+    train_years = list(range(2011, 2021))
+    val_years = list(range(2021, 2023))
+
+    # Datasets
+    train_dataset = SDO_Dataset_channels_FAST(args.zarr_path, train_years, wavelengths, target_size=args.image_size)
+    val_dataset = SDO_Dataset_channels_FAST(args.zarr_path, val_years, wavelengths, target_size=args.image_size)
+
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+
+    # Modello
+# Nel main del file creato precedentemente:
+    model = mae_model_channel_masking_9ch_with_temporal_attn(
+        img_size=args.image_size, 
+        patch_size=args.patch_size,
+        in_chans=len(wavelengths)
+    ).to(args.device)
+
+    # Optimizer & Scheduler
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.1)
+
+    # WandB Initialization
+    wandb.init(
+        project=args.wandb_project,
+        name=f"{args.wandb_run_name}_{args.image_size}",
+        config=vars(args)
+    )
+
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
+    best_val_loss = float('inf')
+
+    for epoch in range(args.epochs):
+        # --- TRAIN ---
+        model.train()
+        total_train_loss = 0
+        pbar_train = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Train]")
+        for batch in pbar_train:
+            batch = batch.to(args.device)
+            loss, _, _ = model(batch)
             
-            # Forward pass
-            loss, pred, mask = model(batch)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
             
-            # Accumulate loss
-            val_loss += loss.item()
-            val_batches += 1
-            
-            # Update progress bar
-            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-    
-    avg_val_loss = val_loss / val_batches
-    
-    # Update learning rate
-    scheduler.step()
-    current_lr = optimizer.param_groups[0]['lr']
-    
-    # Log to wandb
-    wandb.log({
-        'epoch': epoch + 1,
-        'train_loss': avg_train_loss,
-        'val_loss': avg_val_loss,
-        'learning_rate': current_lr
-    })
-    
-    # Print epoch summary
-    print(f"\nEpoch {epoch+1}/{num_epochs}:")
-    print(f"  Train Loss: {avg_train_loss:.4f}")
-    print(f"  Val Loss:   {avg_val_loss:.4f}")
-    print(f"  LR:         {current_lr:.6f}")
-    
-    # Save checkpoint
-    if (epoch + 1) % save_every == 0:
-        checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch+1}.pth')
-        torch.save({
-            'epoch': epoch + 1,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_state_dict': scheduler.state_dict(),
-            'train_loss': avg_train_loss,
-            'val_loss': avg_val_loss,
-        }, checkpoint_path)
-        print(f"  Checkpoint saved: {checkpoint_path}")
-    
-    # Save best model
-    if avg_val_loss < best_val_loss:
-        best_val_loss = avg_val_loss
-        best_model_path = os.path.join(checkpoint_dir, 'best_model.pth')
-        torch.save({
-            'epoch': epoch + 1,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_state_dict': scheduler.state_dict(),
-            'train_loss': avg_train_loss,
-            'val_loss': avg_val_loss,
-        }, best_model_path)
-        print(f"  Best model saved! Val Loss: {best_val_loss:.4f}")
-    
-    print("-" * 60)
+            total_train_loss += loss.item()
+            pbar_train.set_postfix({'loss': f'{loss.item():.4f}'})
 
-# Save final model
-final_model_path = os.path.join(checkpoint_dir, 'final_model.pth')
-torch.save({
-    'epoch': num_epochs,
-    'model_state_dict': model.state_dict(),
-    'optimizer_state_dict': optimizer.state_dict(),
-    'scheduler_state_dict': scheduler.state_dict(),
-    'train_loss': avg_train_loss,
-    'val_loss': avg_val_loss,
-}, final_model_path)
+        avg_train_loss = total_train_loss / len(train_loader)
 
-print(f"\n{'='*60}")
-print(f"Training completed!")
-print(f"Final model saved: {final_model_path}")
-print(f"Best validation loss: {best_val_loss:.4f}")
-print(f"{'='*60}")
+        # --- VAL ---
+        model.eval()
+        total_val_loss = 0
+        with torch.no_grad():
+            pbar_val = tqdm(val_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Val]")
+            for batch in pbar_val:
+                batch = batch.to(args.device)
+                loss, _, _ = model(batch)
+                total_val_loss += loss.item()
+                pbar_val.set_postfix({'loss': f'{loss.item():.4f}'})
 
-wandb.finish()
+        avg_val_loss = total_val_loss / len(val_loader)
+        
+        scheduler.step()
+        curr_lr = optimizer.param_groups[0]['lr']
+
+        # Logging
+        wandb.log({
+            "epoch": epoch + 1,
+            "train_loss": avg_train_loss,
+            "val_loss": avg_val_loss,
+            "lr": curr_lr
+        })
+
+        print(f"Epoch {epoch+1}: Train Loss {avg_train_loss:.4f}, Val Loss {avg_val_loss:.4f}")
+
+        # Save Logic
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            torch.save(model.state_dict(), os.path.join(args.checkpoint_dir, "best_model.pth"))
+
+        if (epoch + 1) % args.save_every == 0:
+            torch.save(model.state_dict(), os.path.join(args.checkpoint_dir, f"checkpoint_{epoch+1}.pth"))
+
+    wandb.finish()
+
+if __name__ == "__main__":
+    train()
