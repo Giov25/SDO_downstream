@@ -31,7 +31,7 @@ def get_args():
     parser.add_argument('--save_plot', type=str, default="inference_results.png")
     
     # Hyperparameters
-    parser.add_argument('--batch_size', type=int, default=20)
+    parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--epochs', type=int, default=200)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--image_size', type=int, default=512)
@@ -76,51 +76,50 @@ def main():
         train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
         val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=4)
     else:
-        train_ds = SDO_9Channel_Dataset(args.zarr_path, train_years, wavelengths, target_size=args.image_size)
-        val_ds = SDO_9Channel_Dataset(args.zarr_path, val_years, wavelengths, target_size=args.image_size)
-        
-        train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
-        val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=4)
+
         test_ds = SDO_9Channel_Dataset(args.zarr_path, test_years, wavelengths, target_size=args.image_size)
         test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=4)
 
     # --- Model Setup ---
     model = setup_model(args, device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
+    criterion = DiceCELoss(to_onehot_y=True, softmax=True, lambda_dice=1.5, lambda_ce=1.0, include_background=False)
+    # dice_metric: senza background (solo foreground)
+    dice_metric = DiceMetric(include_background=False, reduction="mean")
+    # dice_metric_T: con background (entrambe le classi)
+    dice_metric_T = DiceMetric(include_background=True, reduction="mean")
+    warmup_epochs = 20
+    warmup_scheduler = LinearLR(
+        optimizer, 
+        start_factor=0.1, 
+        total_iters=warmup_epochs
+    )
 
+    # Scheduler 2: Cosine Decay
+    cosine_scheduler = CosineAnnealingLR(
+        optimizer, 
+        T_max=args.epochs - warmup_epochs, 
+        eta_min=1e-6 # LR minimo alla fine del training
+    )
+
+    # Unione dei due
+    scheduler = SequentialLR(
+        optimizer, 
+        schedulers=[warmup_scheduler, cosine_scheduler], 
+        milestones=[warmup_epochs]
+    )
+    
+    post_pred = Compose([
+    AsDiscrete(argmax=True, to_onehot=2) # [B,2,H,W] logits → [B,2,H,W] one-hot
+    ])
+    
+    post_label = Compose([
+    AsDiscrete(to_onehot=2) # [B,1,H,W] indices {0,1} → [B,2,H,W] one-hot
+    ]) 
     # --- Execution ---
     if args.mode != 'test':
         print("Starting Training Mode...")
-        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
-        criterion = DiceCELoss(to_onehot_y=True, softmax=True, lambda_dice=1.5, lambda_ce=1.0, include_background=False)
-        dice_metric = DiceMetric(include_background=False, reduction="mean")
-        warmup_epochs = 20
-        warmup_scheduler = LinearLR(
-            optimizer, 
-            start_factor=0.1, 
-            total_iters=warmup_epochs
-        )
 
-        # Scheduler 2: Cosine Decay
-        cosine_scheduler = CosineAnnealingLR(
-            optimizer, 
-            T_max=args.epochs - warmup_epochs, 
-            eta_min=1e-6 # LR minimo alla fine del training
-        )
-
-        # Unione dei due
-        scheduler = SequentialLR(
-            optimizer, 
-            schedulers=[warmup_scheduler, cosine_scheduler], 
-            milestones=[warmup_epochs]
-        )
-        
-        post_pred = Compose([
-        AsDiscrete(argmax=True, to_onehot=2) # [B,2,H,W] logits → [B,2,H,W] one-hot
-        ])
-        
-        post_label = Compose([
-        AsDiscrete(to_onehot=2) # [B,1,H,W] indices {0,1} → [B,2,H,W] one-hot
-        ]) 
         run = wandb.init(
             project="seg-sdo",           # Nome del progetto
             name="esperimento-dgx",               # Nome del run (opzionale)
@@ -154,7 +153,8 @@ def main():
                 post_label=post_label,
                 model_save_path=args.model_path,
                 wandb_run=run, # Passa wandb run per logging
-                max_grad_norm=1.0 # Gradient clipping
+                max_grad_norm=1.0, # Gradient clipping
+                dice_metric_T=dice_metric_T, # Funzione di dice corretta con background
                 )
             
         else:
@@ -179,14 +179,9 @@ def main():
 
     elif args.mode == 'test':
         print("Starting Inference Mode...")
-        from utils_2 import test_and_plot # Assumes the function is in this file
-        dice_list, mean_dice = test_and_plot(
-            model, 
-            train_loader, 
-            device, 
-            n_images=args.batch_size, 
-            save_path=args.save_plot
-        )
+        from utils_2 import testing
+        val_metric, val_metric_T = testing(model, test_loader, device, dice_metric, dice_metric_T)
+        print(f"Test Dice (no bg): {val_metric:.4f}, Test Dice (with bg): {val_metric_T:.4f}")
 
 if __name__ == "__main__":
     main()
