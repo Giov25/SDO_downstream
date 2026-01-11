@@ -776,3 +776,124 @@ class MAE_UNet_Segmentation(nn.Module):
         # Il decoder fa skip-connection e upsampling fino a 512x512
         mask = self.decoder(features)
         return mask
+    
+### MODIFICA 11 GENNAIO 2026
+class ASPPLite(nn.Module):
+    def __init__(self, in_ch, out_ch, rates=[1, 6, 12]):
+        super().__init__()
+        self.stages = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=r, dilation=r, groups=in_ch, bias=False),
+                nn.Conv2d(out_ch, out_ch, kernel_size=1, bias=False),
+                nn.BatchNorm2d(out_ch),
+                nn.ReLU(inplace=True)
+            ) for r in rates
+        ])
+        self.bottleneck = nn.Sequential(
+            nn.Conv2d(out_ch * len(rates), out_ch, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        out = torch.cat([stage(x) for stage in self.stages], dim=1)
+        return self.bottleneck(out)
+
+class SCSEBlock(nn.Module):
+    def __init__(self, in_ch):
+        super().__init__()
+        self.cSE = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_ch, in_ch // 2, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_ch // 2, in_ch, 1),
+            nn.Sigmoid()
+        )
+        self.sSE = nn.Sequential(nn.Conv2d(in_ch, 1, 1), nn.Sigmoid())
+
+    def forward(self, x):
+        return x * self.cSE(x) + x * self.sSE(x)
+    
+class AdvancedUNetViTDecoder(nn.Module):
+    def __init__(self, num_classes=2, embed_dim=768):
+        super().__init__()
+        
+        # 1. Proiezioni iniziali (CoordConv aggiunge 2 canali alla prima proiezione)
+        self.proj4 = nn.Conv2d(embed_dim + 2, 256, kernel_size=1)
+        self.proj3 = nn.Conv2d(embed_dim, 128, kernel_size=1)
+        self.proj2 = nn.Conv2d(embed_dim, 64, kernel_size=1)
+        self.proj1 = nn.Conv2d(embed_dim, 32, kernel_size=1)
+
+        # 2. Modulo ASPP sul collo di bottiglia (feature f4)
+        self.aspp = ASPPLite(256, 256)
+
+        # 3. Upsampling con PixelShuffle
+        self.up1 = PixelShuffleUpsample(256, 128)
+        self.up2 = PixelShuffleUpsample(128 + 128, 64)
+        self.up3 = PixelShuffleUpsample(64 + 64, 32)
+        
+        # 4. Blocchi di attenzione scSE per raffinare dopo le concatenazioni
+        self.attn2 = SCSEBlock(128 + 128)
+        self.attn3 = SCSEBlock(64 + 64)
+        self.attn_final = SCSEBlock(32 + 32)
+
+        # 5. Testa finale
+        self.final_head = nn.Sequential(
+            depthwise_separable_conv(32 + 32, 32),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, num_classes, kernel_size=1)
+        )
+
+    def add_coord(self, x):
+        """Implementazione CoordConv: aggiunge canali X e Y normalizzati"""
+        B, C, H, W = x.shape
+        grid_h = torch.linspace(-1, 1, H, device=x.device).view(1, 1, H, 1).expand(B, 1, H, W)
+        grid_w = torch.linspace(-1, 1, W, device=x.device).view(1, 1, 1, W).expand(B, 1, H, W)
+        return torch.cat([x, grid_h, grid_w], dim=1)
+
+    def forward(self, features):
+        f1, f2, f3, f4 = features 
+
+        # Stage 1: Bottleneck + CoordConv + ASPP
+        x = self.add_coord(f4)
+        x = self.proj4(x)
+        x = self.aspp(x) # Estrazione contesto multi-scala
+        x = self.up1(x)  # 64x64 -> 128x128
+
+        # Stage 2: 128x128
+        s3 = self.proj3(f3)
+        s3 = F.interpolate(s3, size=x.shape[2:], mode='bilinear', align_corners=False)
+        x = torch.cat([x, s3], dim=1)
+        x = self.attn2(x) # Attenzione spaziale/canale
+        x = self.up2(x)  # -> 256x256
+
+        # Stage 3: 256x256
+        s2 = self.proj2(f2)
+        s2 = F.interpolate(s2, size=x.shape[2:], mode='bilinear', align_corners=False)
+        x = torch.cat([x, s2], dim=1)
+        x = self.attn3(x)
+        x = self.up3(x)  # -> 512x512
+
+        # Stage 4: Finale
+        s1 = self.proj1(f1)
+        s1 = F.interpolate(s1, size=x.shape[2:], mode='bilinear', align_corners=False)
+        x = torch.cat([x, s1], dim=1)
+        x = self.attn_final(x)
+        
+        return self.final_head(x)
+    
+    
+class MAE_Seg_Advanced(nn.Module):
+    def __init__(self, mae_model, num_classes=2):
+        super().__init__()
+        self.encoder = MAEFeatureExtractor(mae_model)
+        # Assumendo embed_dim=768 per il MAE Base
+        self.decoder = AdvancedUNetViTDecoder(num_classes=num_classes, embed_dim=768)
+
+    def forward(self, x):
+        # Estrae la lista di 4 feature map (layer 3, 6, 9, 12)
+        features = self.encoder(x)
+        # Il decoder fa skip-connection e upsampling fino a 512x512
+        mask = self.decoder(features)
+        return mask

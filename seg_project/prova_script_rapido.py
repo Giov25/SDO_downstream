@@ -13,7 +13,7 @@ from monai.transforms import AsDiscrete, Compose
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from unet_pytorch.model import UNet
 # Import your custom modules
-from models import MAE_UNet_Segmentation
+from models import MAE_UNet_Segmentation, MAE_Seg_Advanced
 from mae.models_mae_2 import mae_model_channel_masking_9ch_with_temporal_attn
 from dataset import SDO_9Channel_Dataset
 from utils_2 import train_model  # Ensure this matches your project structure
@@ -56,7 +56,14 @@ def setup_model(args, device):
             param.requires_grad = False
 
         
+    elif args.model == 'MAE_Seg_Advanced':
+        mae_backbone = mae_model_channel_masking_9ch_with_temporal_attn().to(device)
+        model = MAE_Seg_Advanced(mae_backbone, num_classes=2).to(device)
         
+        # OPZIONALE: Se vuoi freezare l'encoder all'inizio per stabilizzare il decoder
+        for param in model.encoder.parameters():
+            param.requires_grad = False
+            
     elif args.model == 'Unet':
         model = UNet(
             in_channels=9,
