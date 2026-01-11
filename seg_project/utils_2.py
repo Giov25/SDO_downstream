@@ -8,8 +8,80 @@ import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
 import wandb
+import os
 
+# def visualize_batch(loader):
+#     batch = next(iter(loader))
+#     image = batch["image"]
+#     mask = batch["mask"]
+#     no_limb = batch["ic_no_limb_dark"]
+#     images = image[0].numpy()[0,:,:]
+#     img = plot_grid_to_image(images, colormaps)
+#     print(img.shape)
+#     #images=image.squeeze(0).squeeze(0).cpu().numpy()[0,:,:]
+#     label = mask.squeeze(0).squeeze(0).cpu().numpy()[0,:,:]
+#     no_limb = no_limb.squeeze(0).squeeze(0).cpu().numpy()[0,:,:]
+#     plt.figure(figsize=(10, 10))
+#     plt.subplot(1, 3, 1)
+#     #plt.imshow(images[0], cmap='gray')
+#     plt.imshow(img, cmap='gray')
+#     plt.axis('off')
+#     plt.title('Data')
 
+#     plt.subplot(1, 3, 2)
+#     plt.imshow(label[0], cmap='gray')
+#     plt.axis('off')
+#     plt.title('Label')
+    
+#     plt.subplot(1, 3, 3)
+#     plt.imshow(no_limb[0], cmap='gray')
+#     plt.axis('off')
+#     plt.title('No Limb Darkening')
+#     plt.tight_layout()
+#     plt.show()
+    
+#     return label[0], images[0], no_limb[0]
+    
+# def dice_score_wt_bg(pred, target, epsilon=1e-6):
+#     if not isinstance(pred, np.ndarray):
+#         pred = np.array(pred)
+#     if not isinstance(target, np.ndarray):
+#         target = np.array(target)
+
+#     pred_flat = pred.reshape(pred.shape[0], pred.shape[1], -1)
+#     target_flat = target.reshape(target.shape[0], target.shape[1], -1)
+
+#     intersection = (pred_flat * target_flat).sum(axis=2)
+
+#     dice = (2. * intersection + epsilon) / (pred_flat.sum(axis=2) + target_flat.sum(axis=2) + epsilon)
+#     return dice.mean()
+
+# def dice_score_bg(pred, target, epsilon=1e-6, include_background=False):
+#     """
+#     Calcola il Dice score tra pred e target.
+#     Può escludere il background (primo canale) se include_background=False.
+#     """
+#     # Assicurati che pred e target siano tensori PyTorch
+#     if not isinstance(pred, torch.Tensor):
+#         pred = torch.tensor(pred)
+#     if not isinstance(target, torch.Tensor):
+#         target = torch.tensor(target)
+
+#     # Escludi il background (primo canale) se richiesto
+#     if not include_background:
+#         pred = pred[:, 1:]  # Escludi il primo canale
+#         target = target[:, 1:]  # Escludi il primo canale
+
+#     # Cambia la forma dei tensori
+#     pred_flat = pred.view(pred.shape[0], pred.shape[1], -1)
+#     target_flat = target.view(target.shape[0], target.shape[1], -1)
+
+#     # Calcola l'intersezione
+#     intersection = (pred_flat * target_flat).sum(dim=2)
+
+#     # Calcola il Dice score
+#     dice = (2. * intersection + epsilon) / (pred_flat.sum(dim=2) + target_flat.sum(dim=2) + epsilon)
+#     return dice.mean()
 def log_predictions_to_wandb(model, test_loader, device, num_images=6, epoch=0, phase="validation", dice_metric=None):
     """
     Log predictions to wandb with image, mask, and prediction
@@ -86,80 +158,6 @@ def log_predictions_to_wandb(model, test_loader, device, num_images=6, epoch=0, 
     
     model.train()
 
-
-# def visualize_batch(loader):
-#     batch = next(iter(loader))
-#     image = batch["image"]
-#     mask = batch["mask"]
-#     no_limb = batch["ic_no_limb_dark"]
-#     images = image[0].numpy()[0,:,:]
-#     img = plot_grid_to_image(images, colormaps)
-#     print(img.shape)
-#     #images=image.squeeze(0).squeeze(0).cpu().numpy()[0,:,:]
-#     label = mask.squeeze(0).squeeze(0).cpu().numpy()[0,:,:]
-#     no_limb = no_limb.squeeze(0).squeeze(0).cpu().numpy()[0,:,:]
-#     plt.figure(figsize=(10, 10))
-#     plt.subplot(1, 3, 1)
-#     #plt.imshow(images[0], cmap='gray')
-#     plt.imshow(img, cmap='gray')
-#     plt.axis('off')
-#     plt.title('Data')
-
-#     plt.subplot(1, 3, 2)
-#     plt.imshow(label[0], cmap='gray')
-#     plt.axis('off')
-#     plt.title('Label')
-    
-#     plt.subplot(1, 3, 3)
-#     plt.imshow(no_limb[0], cmap='gray')
-#     plt.axis('off')
-#     plt.title('No Limb Darkening')
-#     plt.tight_layout()
-#     plt.show()
-    
-#     return label[0], images[0], no_limb[0]
-    
-# def dice_score_wt_bg(pred, target, epsilon=1e-6):
-#     if not isinstance(pred, np.ndarray):
-#         pred = np.array(pred)
-#     if not isinstance(target, np.ndarray):
-#         target = np.array(target)
-
-#     pred_flat = pred.reshape(pred.shape[0], pred.shape[1], -1)
-#     target_flat = target.reshape(target.shape[0], target.shape[1], -1)
-
-#     intersection = (pred_flat * target_flat).sum(axis=2)
-
-#     dice = (2. * intersection + epsilon) / (pred_flat.sum(axis=2) + target_flat.sum(axis=2) + epsilon)
-#     return dice.mean()
-
-# def dice_score_bg(pred, target, epsilon=1e-6, include_background=False):
-#     """
-#     Calcola il Dice score tra pred e target.
-#     Può escludere il background (primo canale) se include_background=False.
-#     """
-#     # Assicurati che pred e target siano tensori PyTorch
-#     if not isinstance(pred, torch.Tensor):
-#         pred = torch.tensor(pred)
-#     if not isinstance(target, torch.Tensor):
-#         target = torch.tensor(target)
-
-#     # Escludi il background (primo canale) se richiesto
-#     if not include_background:
-#         pred = pred[:, 1:]  # Escludi il primo canale
-#         target = target[:, 1:]  # Escludi il primo canale
-
-#     # Cambia la forma dei tensori
-#     pred_flat = pred.view(pred.shape[0], pred.shape[1], -1)
-#     target_flat = target.view(target.shape[0], target.shape[1], -1)
-
-#     # Calcola l'intersezione
-#     intersection = (pred_flat * target_flat).sum(dim=2)
-
-#     # Calcola il Dice score
-#     dice = (2. * intersection + epsilon) / (pred_flat.sum(dim=2) + target_flat.sum(dim=2) + epsilon)
-#     return dice.mean()
-
 def _dice_score_numpy(pred, gt, eps=1e-8):
     """Compute Dice score between two binary numpy arrays."""
     pred = pred.astype(np.bool_)
@@ -198,22 +196,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device, scheduler, max_
     
     epoch_loss /= step
     return epoch_loss
-'''
-        outputs = model(inputs.to(device))
 
-        if outputs.dim() >= 4 and outputs.shape[1] > 1:
-            probs = torch.softmax(outputs, dim=1)
-            preds = torch.argmax(probs, dim=1, keepdim=True).float()
- 
-        for i in range(inputs.shape[0]):
-
-            gt_mask = labels[i, 0].cpu().numpy().astype(np.uint8)
-            pred_mask = preds[i].squeeze(0).cpu().numpy().astype(np.uint8)
-            dice_i = _dice_score_numpy(pred_mask, gt_mask)
-            dice_list.append(dice_i)
-        mean_dice = float(np.mean(dice_list)) if len(dice_list) > 0 else 0.0
-            
-'''
 def testing(model, loader, device, dice_score, dice_score_T):
     model.eval()
     epoch_loss = 0
@@ -342,7 +325,6 @@ def predict_and_plot(model, loader, device, post_pred, post_label, dice_metric):
 
     return outputs, labels
         
-import os
 def train_model(model, 
                 num_epochs, 
                 train_loader, 
@@ -368,10 +350,10 @@ def train_model(model,
     for epoch in range(num_epochs):
         epoch_start = time()
         
-        #train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device, scheduler, max_grad_norm=max_grad_norm)
+        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device, scheduler, max_grad_norm=max_grad_norm)
         val_loss, val_metric, val_metric_T = validate_one_epoch(model, test_loader, criterion, device, dice_metric, post_pred, post_label, dice_score_T=dice_metric_T)
         epoch_time = time() - epoch_start
-        train_loss=0
+        
         
         if scheduler:
             scheduler.step()
@@ -402,6 +384,7 @@ def train_model(model,
             max_validation = val_metric
             if model_save_path:
                 os.makedirs(os.path.dirname(model_save_path), exist_ok=True)
+                print(f"\n  New best model found! Saving model to {model_save_path} ...")
                 torch.save({
                     'epoch': epoch + 1,
                     'model_state_dict': model.state_dict(),

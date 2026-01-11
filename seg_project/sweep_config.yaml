@@ -1,0 +1,32 @@
+# config_sweep.yaml
+program: prova_script_rapido.py  
+method: bayes
+metric:
+  name: val/dice_score
+  goal: maximize
+
+parameters:
+  # Prova diversi learning rate in un range continuo (scala logaritmica)
+  lr:
+    distribution: log_uniform_values
+    min: 1e-5
+    max: 1e-3
+  
+  # Prova questi specifici batch size
+  batch_size:
+    values: [8, 16]
+
+  # Puoi anche testare il numero di epoche o la dimensione immagine se vuoi
+  epochs:
+    value: 200
+
+# Comandi fissi da passare a argparse
+command:
+  - ${env}
+  - python
+  - ${program}
+  - "--mode"
+  - "train"
+  - "--model"
+  - "MAE_UNet_Segmentation"
+  - ${args}
