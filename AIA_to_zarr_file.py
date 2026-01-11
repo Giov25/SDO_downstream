@@ -244,7 +244,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Process AIA files and generate Zarr datasets.")
     parser.add_argument("--folder_path", type=str, default="/home/gpatane/Dataset/AIA_IC_M_folder/", help="Path to the folder containing AIA files")
     parser.add_argument('--output_folder', type=str, default="/home/gpatane/Dataset/zarr_file_magnetogram_1024_definitivo.zarr")
-    parser.add_argument('--overwrite', action='store_true', default=False, help='Allow existing output folder without raising an error')
+    parser.add_argument('--overwrite', action='store_true', default=False, help='Allow existing output folder without raising an error. \
+                        If specified it will delete existing contents. If you want to leave existing contents, do not use this flag.')
     parser.add_argument('--start_period', type=int, required=False, default=2011)
     parser.add_argument('--end_period', type=int, required=False, default=2026)
     parser.add_argument('--image_size', type=int, required=False, default=1024, help='Size of the images to process')
