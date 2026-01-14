@@ -897,3 +897,92 @@ class MAE_Seg_Advanced(nn.Module):
         # Il decoder fa skip-connection e upsampling fino a 512x512
         mask = self.decoder(features)
         return mask
+    
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class DeformableRefinementBlock(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.offset_conv = nn.Conv2d(in_ch, 18, kernel_size=3, padding=1) # 18 = 2 (x,y) * 9 punti (3x3)
+        self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1)
+        self.norm = nn.BatchNorm2d(out_ch)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        # In una versione semplificata per il downstream, usiamo le feature 
+        # per guidare un raffinamento locale adattivo
+        return self.relu(self.norm(self.conv(x)))
+    
+class SegDeformerUNetDecoder(nn.Module):
+    def __init__(self, num_classes=2, embed_dim=768):
+        super().__init__()
+        
+        # Proiezioni iniziali
+        self.proj4 = nn.Conv2d(embed_dim, 256, kernel_size=1)
+        self.proj3 = nn.Conv2d(embed_dim, 128, kernel_size=1)
+        self.proj2 = nn.Conv2d(embed_dim, 64, kernel_size=1)
+        self.proj1 = nn.Conv2d(embed_dim, 32, kernel_size=1)
+
+        # Moduli di raffinamento Deformabili (ispirati a SegDeformer)
+        self.refine3 = DeformableRefinementBlock(128, 128)
+        self.refine2 = DeformableRefinementBlock(64, 64)
+        self.refine1 = DeformableRefinementBlock(32, 32)
+
+        # Upsampling
+        self.up1 = PixelShuffleUpsample(256, 128)
+        self.up2 = PixelShuffleUpsample(128 + 128, 64)
+        self.up3 = PixelShuffleUpsample(64 + 64, 32)
+        
+        self.final_head = nn.Sequential(
+            nn.Conv2d(32 + 32, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, num_classes, kernel_size=1)
+        )
+        self.dropout = nn.Dropout2d(0.1)
+
+    def forward(self, features):
+        f1, f2, f3, f4 = features 
+
+        # Stage 1: Deepest features
+        x = self.proj4(f4)
+        x = self.up1(x) 
+
+        # Stage 2: Fusion con raffinamento deformabile
+        s3 = self.refine3(self.proj3(f3))
+        s3 = self.dropout(s3)
+        s3 = F.interpolate(s3, size=x.shape[2:], mode='bilinear', align_corners=False)
+        x = torch.cat([x, s3], dim=1)
+        x = self.up2(x)
+
+        # Stage 3:
+        s2 = self.refine2(self.proj2(f2))
+        s2 = self.dropout(s2)
+        s2 = F.interpolate(s2, size=x.shape[2:], mode='bilinear', align_corners=False)
+        x = torch.cat([x, s2], dim=1)
+        x = self.up3(x)
+
+        # Stage 4: Finale
+        s1 = self.refine1(self.proj1(f1))
+        s1 = self.dropout(s1)
+        s1 = F.interpolate(s1, size=x.shape[2:], mode='bilinear', align_corners=False)
+        x = torch.cat([x, s1], dim=1)
+        
+        return self.final_head(x)
+    
+    
+class MAE_Seg_Deformer(nn.Module):
+    def __init__(self, mae_model, num_classes=2):
+        super().__init__()
+        self.encoder = MAEFeatureExtractor(mae_model)
+        # Assumendo embed_dim=768 per il MAE Base
+        self.decoder = SegDeformerUNetDecoder(num_classes=num_classes, embed_dim=768)
+
+    def forward(self, x):
+        # Estrae la lista di 4 feature map (layer 3, 6, 9, 12)
+        features = self.encoder(x)
+        # Il decoder fa skip-connection e upsampling fino a 512x512
+        mask = self.decoder(features)
+        return mask
