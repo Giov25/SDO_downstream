@@ -13,7 +13,7 @@ from monai.transforms import AsDiscrete, Compose
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from unet_pytorch.model import UNet
 # Import your custom modules
-from models import MAE_UNet_Segmentation, MAE_Seg_Advanced
+from models import MAE_UNet_Segmentation, MAE_Seg_Advanced, MAE_Seg_Deformer
 from mae.models_mae_2 import mae_model_channel_masking_9ch_with_temporal_attn
 from dataset import SDO_9Channel_Dataset
 from utils_2 import train_model  # Ensure this matches your project structure
@@ -50,8 +50,6 @@ def setup_model(args, device):
     if args.model == 'MAE_UNet_Segmentation':
         mae_backbone = mae_model_channel_masking_9ch_with_temporal_attn().to(device)
         model = MAE_UNet_Segmentation(mae_backbone, num_classes=2).to(device)
-    
-        # OPZIONALE: Se vuoi freezare l'encoder all'inizio per stabilizzare il decoder
         for param in model.encoder.parameters():
             param.requires_grad = False
 
@@ -59,8 +57,12 @@ def setup_model(args, device):
     elif args.model == 'MAE_Seg_Advanced':
         mae_backbone = mae_model_channel_masking_9ch_with_temporal_attn().to(device)
         model = MAE_Seg_Advanced(mae_backbone, num_classes=2).to(device)
-        
-        # OPZIONALE: Se vuoi freezare l'encoder all'inizio per stabilizzare il decoder
+        for param in model.encoder.parameters():
+            param.requires_grad = False
+            
+    elif args.model == 'MAE_Seg_Deformer':
+        mae_backbone = mae_model_channel_masking_9ch_with_temporal_attn().to(device)
+        model = MAE_Seg_Deformer(mae_backbone, num_classes=2).to(device)
         for param in model.encoder.parameters():
             param.requires_grad = False
             
@@ -76,8 +78,9 @@ def setup_model(args, device):
     print(f"Frozen parameters: {total_params - trainable_params:,}")
     
     if args.mode == 'test':
-        print(f"Loading weights for inference from: {args.model_path}")
-        checkpoint = torch.load(args.model_path, map_location=device, weights_only=False)
+        checkpoint_path = os.path.join(args.model_path, args.model + ".pth")
+        print(f"Loading weights for inference from: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
         # Handle cases where checkpoint is a dict or a direct state_dict
         state_dict = checkpoint["model_state_dict"] if "model_state_dict" in checkpoint else checkpoint
         model.load_state_dict(state_dict)
@@ -107,7 +110,7 @@ def main():
         
         model = setup_model(args, device)
         # 5. Optimizer & Criterion (Usano args.lr aggiornato)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
         criterion = DiceCELoss(to_onehot_y=True, softmax=True, lambda_dice=1.5, lambda_ce=1.0, include_background=False)
         
         dice_metric = DiceMetric(include_background=False, reduction="mean")
@@ -125,13 +128,15 @@ def main():
 
         # 8. Training Loop
         if args.mode == 'resume':
-            print(f"Resuming training from checkpoint: {args.model_path}")
-            checkpoint = torch.load(args.model_path, map_location=device, weights_only=False)
+            
+            checkpoint_path = os.path.join(args.model_path, args.model + ".pth")
+            print(f"Resuming training from checkpoint: {checkpoint_path}")
+            checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
             state_dict = checkpoint["model_state_dict"] if "model_state_dict" in checkpoint else checkpoint
             model.load_state_dict(state_dict)        
         
         # Chiamata unica a train_model (gestisce sia resume che train normale)
-        save_path = args.model_path if args.mode == 'resume' else os.path.join(args.model_path, (args.model+".pth"))
+        save_path =  os.path.join(args.model_path, (args.model+".pth"))
         
         train_model(
             model=model,
