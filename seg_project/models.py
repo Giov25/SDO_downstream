@@ -813,11 +813,29 @@ class SCSEBlock(nn.Module):
 
     def forward(self, x):
         return x * self.cSE(x) + x * self.sSE(x)
+class FeatureAdapter(nn.Module):
+    """Un semplice blocco per adattare le feature congelate"""
+    def __init__(self, dim, scale=0.1):
+        super().__init__()
+        # Un bottleneck leggero + residual connection scalata
+        self.adapter = nn.Sequential(
+            nn.Conv2d(dim, dim // 4, 1),
+            nn.ReLU(),
+            nn.Conv2d(dim // 4, dim, 1)
+        )
+        self.scale = nn.Parameter(torch.tensor(scale)) 
+
+    def forward(self, x):
+        return x + self.scale * self.adapter(x)
     
 class AdvancedUNetViTDecoder(nn.Module):
     def __init__(self, num_classes=2, embed_dim=768):
         super().__init__()
         
+        self.adapter1 = FeatureAdapter(embed_dim)
+        self.adapter2 = FeatureAdapter(embed_dim)
+        self.adapter3 = FeatureAdapter(embed_dim)
+        self.adapter4 = FeatureAdapter(embed_dim)
         # 1. Proiezioni iniziali (CoordConv aggiunge 2 canali alla prima proiezione)
         self.proj4 = nn.Conv2d(embed_dim + 2, 256, kernel_size=1)
         self.proj3 = nn.Conv2d(embed_dim, 128, kernel_size=1)
@@ -854,7 +872,11 @@ class AdvancedUNetViTDecoder(nn.Module):
 
     def forward(self, features):
         f1, f2, f3, f4 = features 
-
+        
+        f1 = self.adapter1(f1)
+        f2 = self.adapter2(f2)
+        f3 = self.adapter3(f3)
+        f4 = self.adapter4(f4)
         # Stage 1: Bottleneck + CoordConv + ASPP
         x = self.add_coord(f4)
         x = self.proj4(x)
@@ -882,6 +904,8 @@ class AdvancedUNetViTDecoder(nn.Module):
         x = self.attn_final(x)
         
         return self.final_head(x)
+    
+
     
     
 class MAE_Seg_Advanced(nn.Module):

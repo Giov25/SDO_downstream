@@ -58,15 +58,19 @@ class SDO_9Channel_Dataset(Dataset):
         
         # 1. Caricamento e Normalizzazione dei 9 canali AIA
         aia_imgs = []
-        for wl in self.wavelengths:
+        for i, wl in enumerate(self.wavelengths):
             img = self.z[year][wl][local_idx].astype(np.float32)
-            
+            img_scaled = 0.01 * img
+            img_transformed = np.sign(img_scaled) * np.log1p(np.abs(img_scaled))
+            if hasattr(self, 'means') and self.means is not None:
+                img_transformed = (img_transformed - self.means[i]) / (self.stds[i] + 1e-8)        
+            aia_imgs.append(img_transformed)
             # Normalizzazione Robust Percentile (2.5% - 99.5%)
-            p_low, p_high = np.percentile(img, [2.5, 99.5])
-            img = np.clip(img, p_low, p_high)
-            img = (img - p_low) / (p_high - p_low + 1e-6)
+            # p_low, p_high = np.percentile(img, [2.5, 99.5])
+            # img = np.clip(img, p_low, p_high)
+            # img = (img - p_low) / (p_high - p_low + 1e-6)
             
-            aia_imgs.append(img)
+            # aia_imgs.append(img)
             
         # Stack dei 9 canali: [9, H, W]
         aia_stack = np.stack(aia_imgs, axis=0)

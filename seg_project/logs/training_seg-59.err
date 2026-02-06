@@ -1,0 +1,7 @@
+
+CondaError: Run 'conda init' before 'conda activate'
+
+Traceback (most recent call last):
+  File "/home/gpatane/first_project/SDO_downstream/seg_project/prova_script_rapido.py", line 14, in <module>
+    from unet_pytorch.model import UNet
+ModuleNotFoundError: No module named 'unet_pytorch'

@@ -199,45 +199,80 @@ def train_one_epoch(model, loader, criterion, optimizer, device, scheduler, max_
 
 def testing(model, loader, device, dice_score, dice_score_T):
     model.eval()
-    epoch_loss = 0
-    step = 0
-
+    
+    # Liste per salvare i risultati
     dice_scores = []
     dice_scores_T = []
+    iou_scores = []      # <--- NUOVO: IoU solo Foreground
+    iou_scores_T = []    # <--- NUOVO: Mean IoU (Background + Foreground)
+
     with torch.no_grad():
         for batch in tqdm(loader, desc="Testing"):
             data = batch['image'].to(device)
             labels = batch['mask'].to(device)
+            
             outputs = model(data)
+            
+            # Gestione output
             if outputs.dim() >= 4 and outputs.shape[1] > 1:
                 probs = torch.softmax(outputs, dim=1)
                 preds = torch.argmax(probs, dim=1, keepdim=True).float()
-    
+            else:
+                # Fallback nel caso output sia [B, 1, H, W] (attivazione sigmoide)
+                preds = (torch.sigmoid(outputs) > 0.5).float()
+
             for i in range(data.shape[0]):
                 # Get masks: [H, W]
-                gt_mask = labels[i, 0].long()  # [H, W]
-                pred_mask = preds[i, 0].long()  # [H, W]
+                gt_mask = labels[i, 0].long()    # [H, W] (valori 0 o 1)
+                pred_mask = preds[i, 0].long()   # [H, W] (valori 0 o 1)
                 
-                # Convert to one-hot: [H, W] -> [H, W, C] -> [C, H, W] -> [1, C, H, W]
-                gt_one_hot = torch.nn.functional.one_hot(gt_mask, num_classes=2).permute(2, 0, 1).unsqueeze(0).float()  # [1, 2, H, W]
-                pred_one_hot = torch.nn.functional.one_hot(pred_mask, num_classes=2).permute(2, 0, 1).unsqueeze(0).float()  # [1, 2, H, W]
+                # --- CALCOLO DICE (Codice Originale) ---
+                # Convert to one-hot: [1, 2, H, W]
+                gt_one_hot = torch.nn.functional.one_hot(gt_mask, num_classes=2).permute(2, 0, 1).unsqueeze(0).float()
+                pred_one_hot = torch.nn.functional.one_hot(pred_mask, num_classes=2).permute(2, 0, 1).unsqueeze(0).float()
                 
-                # dice_score: without background (only foreground class)
-                dice_i = dice_score(pred_one_hot, gt_one_hot)  # include_background=False
-                # Replace NaN with 1.0 (perfect score when class is absent in both GT and pred)
+                # dice_score: only foreground
+                dice_i = dice_score(pred_one_hot, gt_one_hot)
                 dice_i = torch.nan_to_num(dice_i, nan=1.0)
                 dice_scores.append(dice_i.mean().item())
                 
-                # dice_score_T: with background (both classes)
+                # dice_score_T: with background
                 if dice_score_T is not None:
-                    dice_T = dice_score_T(pred_one_hot, gt_one_hot)  # include_background=True
+                    dice_T = dice_score_T(pred_one_hot, gt_one_hot)
                     dice_T = torch.nan_to_num(dice_T, nan=1.0)
                     dice_scores_T.append(dice_T.mean().item())
-    metric = np.mean(dice_scores) if dice_scores else 0.0
-    metric_T = np.mean(dice_scores_T) if dice_scores_T else 0.0
-    return metric, metric_T
+
+                # --- CALCOLO IOU (NUOVO) ---
+                # L'IoU si calcola come: Intersezione / Unione
+                
+                # 1. IoU Classe 1 (Foreground)
+                inter_1 = ((pred_mask == 1) & (gt_mask == 1)).sum().item()
+                union_1 = ((pred_mask == 1) | (gt_mask == 1)).sum().item()
+                
+                # Gestione divisione per zero: se union è 0, significa che non c'è oggetto né in GT né in Pred -> IoU = 1.0
+                iou_1 = inter_1 / union_1 if union_1 > 0 else 1.0
+                iou_scores.append(iou_1)
+
+                # 2. IoU Totale (Mean IoU: media tra bg e fg)
+                if dice_score_T is not None:
+                    # Calcolo anche per Classe 0 (Background)
+                    inter_0 = ((pred_mask == 0) & (gt_mask == 0)).sum().item()
+                    union_0 = ((pred_mask == 0) | (gt_mask == 0)).sum().item()
+                    iou_0 = inter_0 / union_0 if union_0 > 0 else 1.0
                     
-            
+                    # Mean IoU
+                    mean_iou = (iou_0 + iou_1) / 2
+                    iou_scores_T.append(mean_iou)
+
+    # Calcolo medie finali
+    metric_dice = np.mean(dice_scores) if dice_scores else 0.0
+    metric_dice_T = np.mean(dice_scores_T) if dice_scores_T else 0.0
+    
+    metric_iou = np.mean(iou_scores) if iou_scores else 0.0
+    metric_iou_T = np.mean(iou_scores_T) if iou_scores_T else 0.0
+
+    # Ritorna 4 valori: Dice FG, Dice Tot, IoU FG, IoU Tot
+    return metric_dice, metric_dice_T, metric_iou, metric_iou_T            
 def validate_one_epoch(model, loader, criterion, device, dice_score, post_pred, post_label, dice_score_T=None):
     model.eval()
     epoch_loss = 0
@@ -340,14 +375,15 @@ def train_model(model,
                 model_save_path=None,
                 wandb_run=None,
                 max_grad_norm=1.0,
-                log_images_every=5  # Log predictions ogni N epochs
-                
+                log_images_every=5,  # Log predictions ogni N epochs
+                start_epoch=0,  # Epoca da cui riprendere
+                best_dice=0.0  # Miglior dice score precedente
                 ):
     train_losses, val_losses, val_dice_scores, val_dice_scores_T = [], [], [], []
-    max_validation = 0.0
+    max_validation = best_dice
     since = time()
     
-    for epoch in range(num_epochs):
+    for epoch in range(start_epoch, num_epochs):
         epoch_start = time()
         
         train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device, scheduler, max_grad_norm=max_grad_norm)
@@ -385,7 +421,7 @@ def train_model(model,
             if model_save_path:
                 os.makedirs(os.path.dirname(model_save_path), exist_ok=True)
                 print(f"\n  New best model found! Saving model to {model_save_path} ...")
-                torch.save({
+                checkpoint_data = {
                     'epoch': epoch + 1,
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
@@ -394,7 +430,14 @@ def train_model(model,
                     'val_loss': val_loss,
                     'val_dice': val_metric,
                     'val_dice_T': val_metric_T,
-                }, model_save_path)
+                }
+                # Salva wandb run id se disponibile
+                if wandb_run:
+                    checkpoint_data['wandb_run_id'] = wandb_run.id
+                    checkpoint_data['wandb_project'] = wandb_run.project
+                    checkpoint_data['wandb_entity'] = wandb_run.entity
+                
+                torch.save(checkpoint_data, model_save_path)
                 
                 print(f"  ✓ Model saved at epoch {epoch+1} with validation dice score: {val_metric:.4f}")
                 
@@ -430,6 +473,166 @@ def train_model(model,
             'val_dice': val_metric,
         }, model_save_path)
     return train_losses, val_losses, val_dice_scores
+
+import os
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+import wandb
+from sunpy.map import Map
+def run_and_plot_predictions_all_channels(model, dataloader, device, dice_metric=None, dice_metric_T=None, 
+                                          n_images=5, threshold=0.5, use_wandb=False, save_path=None):
+    """
+    Esegue il modello e plotta:
+      - Col 1-9: I 9 canali di input
+      - Col 10:  Ground Truth (overlay rosso)
+      - Col 11:  Predizione (overlay blu)
+    
+    Salva sia l'immagine riassuntiva che le singole righe separatamente.
+    """
+    model.eval()
+    batch = next(iter(dataloader))
+    inputs = batch['image']              # Shape: [B, 9, H, W]
+    labels = batch['mask']               # Shape: [B, 1, H, W]
+    gt_images = batch['ic_no_limb_dark'] # Background image [B, 1, H, W]
+
+    batch_size = inputs.shape[0]
+    n_show = min(n_images, batch_size)
+    n_input_channels = inputs.shape[1]   # Dovrebbe essere 9
+
+    # Totale colonne: canali input + GT + Pred
+    total_cols = n_input_channels + 2 
+
+    dice_list = []
+    dice_list_T = []
+
+    with torch.no_grad():
+        outputs = model(inputs.to(device))
+
+        if outputs.dim() >= 4 and outputs.shape[1] > 1:
+            probs = torch.softmax(outputs, dim=1)
+            preds = torch.argmax(probs, dim=1, keepdim=True).float()
+        else:
+            probs = torch.sigmoid(outputs)
+            preds = (probs > threshold).float()
+
+        # Figura principale riassuntiva: molto larga per far stare 11 colonne
+        # Larghezza stimata: 2.5 pollici per colonna -> ~28 pollici
+        fig, axes = plt.subplots(n_show, total_cols, figsize=(2.5 * total_cols, 3.5 * n_show))
+        
+        # Gestione caso singola immagine (axes deve essere sempre 2D [row, col])
+        if n_show == 1:
+            axes = axes.reshape(1, -1)
+
+        for i in range(n_show):
+            # --- MASCHERE E BACKGROUND ---
+            gt_mask = labels[i, 0].cpu().numpy().astype(np.uint8)
+            pred_mask = preds[i].squeeze(0).cpu().numpy().astype(np.uint8)
+            background_img = gt_images[i, 0].cpu().numpy() # Usato per overlay GT/Pred
+
+            # --- CALCOLO DICE ---
+            if dice_metric is not None and dice_metric_T is not None:
+                gt_mask_tensor = labels[i, 0].long().to(device)
+                pred_mask_tensor = preds[i, 0].long().to(device)
+                
+                gt_one_hot = torch.nn.functional.one_hot(gt_mask_tensor, num_classes=2).permute(2, 0, 1).unsqueeze(0).float()
+                pred_one_hot = torch.nn.functional.one_hot(pred_mask_tensor, num_classes=2).permute(2, 0, 1).unsqueeze(0).float()
+                
+                dice_i = dice_metric(pred_one_hot, gt_one_hot)
+                dice_i = torch.nan_to_num(dice_i, nan=1.0).mean().item()
+                dice_i_T = dice_metric_T(pred_one_hot, gt_one_hot)
+                dice_i_T = torch.nan_to_num(dice_i_T, nan=1.0).mean().item()
+            else:
+                intersection = np.logical_and(pred_mask, gt_mask).sum()
+                union = pred_mask.sum() + gt_mask.sum()
+                dice_i = (2. * intersection / (union + 1e-8))
+                dice_i_T = dice_i 
+            
+            dice_list.append(dice_i)
+            dice_list_T.append(dice_i_T)
+
+            # --- PLOT CANALI INPUT (Col 0 a 8) ---
+            for c in range(n_input_channels):
+                img_chan = inputs[i, c].cpu().numpy()
+                # Normalizza ogni canale singolarmente per vederne i dettagli
+                img_chan = (img_chan - img_chan.min()) / (img_chan.max() - img_chan.min() + 1e-8)
+                
+                axes[i, c].imshow(img_chan, cmap='gray')
+                axes[i, c].set_title(f'Ch {c+1}') # Es. Ch 1, Ch 2...
+                axes[i, c].axis('off')
+
+            # --- PLOT GT (Col 9) ---
+            idx_gt = n_input_channels
+            #axes[i, idx_gt].imshow(background_img, cmap='gray', alpha=0.8)
+            axes[i, idx_gt].imshow(gt_mask, cmap='Reds', alpha=0.5, vmin=0, vmax=1)
+            axes[i, idx_gt].set_title('Ground Truth')
+            axes[i, idx_gt].axis('off')
+
+            # --- PLOT PRED (Col 10) ---
+            idx_pred = n_input_channels + 1
+            #axes[i, idx_pred].imshow(background_img, cmap='gray', alpha=0.8)
+            axes[i, idx_pred].imshow(pred_mask, cmap='Blues', alpha=0.5, vmin=0, vmax=1)
+            axes[i, idx_pred].set_title(f'Pred\nDice: {dice_i:.2f}')
+            axes[i, idx_pred].axis('off')
+
+            # --- SALVATAGGIO SINGOLA RIGA ---
+            if save_path:
+                # Creiamo una figura larga per la singola riga
+                fig_single, ax_single = plt.subplots(1, total_cols, figsize=(6.5 * total_cols, 9.5))
+                wl = ['1700A', '1600A', '335A', '304A', '211A', '193A', '171A', '131A', 'Magnetogram']
+                # 1. Input Channels
+                for c in range(n_input_channels):
+                    img_chan = inputs[i, c].cpu().numpy()
+                    img_chan = (img_chan - img_chan.min()) / (img_chan.max() - img_chan.min() + 1e-8)
+                    if c<n_input_channels-1:
+                        cmap ='sdoaia' + wl[c].replace('A', '')
+                    else:
+                        cmap = 'gray'
+                    ax_single[c].imshow(img_chan, cmap=cmap)
+                    ax_single[c].set_title(f'Ch {c+1}')
+                    ax_single[c].axis('off')
+
+                # 2. GT
+                #ax_single[idx_gt].imshow(background_img, cmap='gray', alpha=0.8)
+                ax_single[idx_gt].imshow(gt_mask, cmap='Reds', alpha=0.5, vmin=0, vmax=1)
+                ax_single[idx_gt].set_title('Ground Truth')
+                ax_single[idx_gt].axis('off')
+
+                # 3. Pred
+                #ax_single[idx_pred].imshow(background_img, cmap='gray', alpha=0.8)
+                ax_single[idx_pred].imshow(pred_mask, cmap='Blues', alpha=0.5, vmin=0, vmax=1)
+                ax_single[idx_pred].set_title(f'Dice (FG): {dice_i:.3f}')
+                ax_single[idx_pred].axis('off')
+
+                root, ext = os.path.splitext(save_path)
+                single_row_path = f"{root}_sample_{i}{ext}"
+                
+                plt.tight_layout()
+                fig_single.savefig(single_row_path, dpi=150, bbox_inches='tight')
+                plt.close(fig_single)
+
+    # --- OUTPUT FINALE ---
+    plt.tight_layout()
+    mean_dice = float(np.mean(dice_list)) if len(dice_list) > 0 else 0.0
+    mean_dice_T = float(np.mean(dice_list_T)) if len(dice_list_T) > 0 else 0.0
+
+    if save_path:
+        plt.savefig(save_path, dpi=200, bbox_inches='tight')
+
+    try:
+        if use_wandb and wandb.run is not None:
+            wandb.log({
+                "test/predictions_all_channels": wandb.Image(fig),
+                "test/dice_mean_fg": mean_dice
+            })
+    except Exception as e:
+        print(f"Warning: wandb log failed: {e}")
+
+    print(f"\nMean Dice: {mean_dice_T:.4f}")
+    plt.show()
+    plt.close(fig)
+
+    return dice_list, dice_list_T, mean_dice, mean_dice_T
 
 def test_and_plot(model, dataloader, device, dice_metric=None, dice_metric_T=None, n_images=6, threshold=0.5, use_wandb=False, save_path=None):
     """
