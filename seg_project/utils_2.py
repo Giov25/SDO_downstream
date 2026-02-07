@@ -408,7 +408,7 @@ def train_model(model,
                 "epoch_time": float(epoch_time)
             }
             # Usa epoch come step per avere le epoche sull'asse X
-            wandb.log(log_dict, step=epoch)
+            wandb.log(log_dict)
             
             # Log predictions every N epochs
             if (epoch + 1) % log_images_every == 0 or epoch == 0:
