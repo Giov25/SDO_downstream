@@ -29,9 +29,9 @@ def get_args():
     
     parser.add_argument('--zarr_path', type=str, default="/home/gpatane/Dataset/zarr_file_magnetogram_1024_definitivo.zarr")
     parser.add_argument('--resume_checkpoints', type=str, default=None, help="Path to checkpoint for resuming training.")
-    parser.add_argument('--mae_checkpoint', type=str, default='/home/gpatane/first_project/SDO_downstream/mae_project/checkpoints/1024/best_model.pth')
-    parser.add_argument('--model_path', type=str, default="/home/gpatane/checkpoints/seg_project/checkpoints/")
-    parser.add_argument('--save_plot', type=str, default="/home/gpatane/first_project/SDO_downstream/seg_project/predictions/pred.png")
+    parser.add_argument('--mae_checkpoint', type=str, default='/home/gpatane/checkpoints/mae_ckp/best_model.pth')
+    parser.add_argument('--model_path', type=str, default="/home/gpatane/checkpoints/")
+    parser.add_argument('--save_plot', type=str, default="/home/gpatane/checkpoints/predictions/pred.png")
     parser.add_argument('--checkpoint_path', type=str, default=None, help="Path to model checkpoint for testing or resuming.")
     parser.add_argument('--load_pretrained', action='store_true', 
                             help="Se presente, carica i pesi MAE dal checkpoint. Se assente, allena da zero (Scratch).")
@@ -117,9 +117,9 @@ def main():
     
     # --- Data Setup ---
     wavelengths = ['1700A', '1600A', '335A', '304A', '211A', '193A', '171A', '131A', 'Magnetogram']
-    train_years = list(range(2011, 2021))
-    val_years   = list(range(2021, 2023))
-    test_years  = list(range(2023, 2026))
+    train_years = list(range(2011, 2021,3))
+    val_years   = list(range(2021, 2023,3))
+    #test_years  = list(range(2023, 2026))   #test_years  = list(range(2023, 2024))   
 
     if args.mode != 'test':
         print("Starting training/Sweep mode... ")

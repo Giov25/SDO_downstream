@@ -22,3 +22,6 @@ conda run -n SDOenv python prova_script_rapido.py \
   --lr 1e-4
 
 echo "✅ Fine-tuning training completed!"
+
+
+#python prova_script_rapido.py --mode train --load_pretrained --model MAE_Seg_Deformer --batch_size 3 --epochs 200 --lr 1e-4
