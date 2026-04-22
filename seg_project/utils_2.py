@@ -82,6 +82,47 @@ import os
 #     # Calcola il Dice score
 #     dice = (2. * intersection + epsilon) / (pred_flat.sum(dim=2) + target_flat.sum(dim=2) + epsilon)
 #     return dice.mean()
+def freeze_encoder(model):
+    """
+    Freezes the encoder components of MaskedAutoencoderViT.
+    
+    Frozen components:
+    - patch_embed: patch embedding layer
+    - blocks: transformer encoder blocks
+    - pos_embed: positional embeddings
+    - cls_token: class token
+    - norm: normalization layer
+    """
+    # Freeze patch embedding
+    for param in model.patch_embed.parameters():
+        param.requires_grad = False
+    
+    # Freeze encoder blocks
+    for param in model.blocks.parameters():
+        param.requires_grad = False
+    
+    # Freeze positional embeddings
+    model.pos_embed.requires_grad = False
+    
+    # Freeze class token
+    model.cls_token.requires_grad = False
+    
+    # Freeze normalization layer
+    for param in model.norm.parameters():
+        param.requires_grad = False
+    
+    print("✓ Encoder congelato (frozen)")
+    
+    # Count trainable parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    frozen_params = total_params - trainable_params
+    
+    print(f"  Parametri totali: {total_params:,}")
+    print(f"  Parametri trainabili: {trainable_params:,} ({100*trainable_params/total_params:.1f}%)")
+    print(f"  Parametri congelati: {frozen_params:,} ({100*frozen_params/total_params:.1f}%)")
+    
+    return model
 def log_predictions_to_wandb(model, test_loader, device, num_images=6, epoch=0, phase="validation", dice_metric=None):
     """
     Log predictions to wandb with image, mask, and prediction
@@ -97,7 +138,10 @@ def log_predictions_to_wandb(model, test_loader, device, num_images=6, epoch=0, 
             inputs = batch_data["image"].to(device)
             labels = batch_data["mask"].to(device)
             
-            outputs = model(inputs)  # [B, 2, H, W] logits
+            #outputs = model(inputs)  # [B, 2, H, W] logits
+            _,pred,_ = model(inputs)
+            outputs = model.unpatchify(pred)
+            
             
             # Converti logits in probabilità con softmax
             probs = torch.softmax(outputs, dim=1)  # [B, 2, H, W]
@@ -168,6 +212,92 @@ def _dice_score_numpy(pred, gt, eps=1e-8):
         return 1.0  # both empty -> perfect
     return 2.0 * inter / (denom + eps)
 
+def load_checkpoint_with_channel_adaptation(model, checkpoint_path, in_chans=9, out_chans=2, device='cuda'):
+    """
+    Carica un checkpoint da un modello pre-addestrato e adatta i canali se necessario.
+    Rileva automaticamente quanti canali ha il checkpoint.
+    
+    Args:
+        model: il modello target
+        checkpoint_path: path al checkpoint salvato
+        in_chans: numero di canali input (informativo, non usato)
+        out_chans: numero di canali output del nuovo modello
+        device: dispositivo torch
+    """
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    state_dict = checkpoint["model_state_dict"]
+    
+    # Determina i canali dal checkpoint in base alla forma di decoder_pred.weight
+    original_weight = state_dict['decoder_pred.weight']
+    original_bias = state_dict['decoder_pred.bias']
+    
+    patch_size = model.patch_size
+    weights_per_channel = patch_size ** 2  # 256 per patch_size=16
+    
+    # Calcola quanti canali ha il checkpoint
+    checkpoint_out_chans = original_weight.shape[0] // weights_per_channel
+    
+    print(f"[Load] Checkpoint ha {checkpoint_out_chans} canali, modello target ne aspetta {out_chans}")
+    
+    if checkpoint_out_chans != out_chans:
+        if checkpoint_out_chans > out_chans:
+            # Checkpoint ha PIU' canali: prendi i primi out_chans
+            new_weight = original_weight[:out_chans * weights_per_channel, :]
+            new_bias = original_bias[:out_chans * weights_per_channel]
+            print(f"[Resize] Ridotto decoder_pred: {original_weight.shape} → {new_weight.shape}")
+        else:
+            # Checkpoint ha MENO canali: replica i pesi per i canali mancanti
+            repeats = out_chans // checkpoint_out_chans
+            remainder = out_chans % checkpoint_out_chans
+            
+            new_weight = original_weight.repeat(repeats, 1)
+            new_bias = original_bias.repeat(repeats)
+            
+            if remainder > 0:
+                new_weight = torch.cat([new_weight, original_weight[:remainder * weights_per_channel, :]], dim=0)
+                new_bias = torch.cat([new_bias, original_bias[:remainder * weights_per_channel]])
+            
+            print(f"[Resize] Espanso decoder_pred: {original_weight.shape} → {new_weight.shape}")
+        
+        state_dict['decoder_pred.weight'] = new_weight
+        state_dict['decoder_pred.bias'] = new_bias
+    
+    # Carica lo state_dict adattato
+    model.load_state_dict(state_dict, strict=False)
+    print(f"[Load] ✓ Checkpoint caricato correttamente")
+    
+    return model
+
+
+def train_one_epoch_mod(model, loader, criterion, optimizer, device, scheduler, max_grad_norm=1.0):
+    model.train()
+    epoch_loss = 0
+    step = 0
+
+    for batch in tqdm(loader, desc="Training"):
+        data = batch['image'].to(device)
+        labels = batch['mask'].to(device)
+        optimizer.zero_grad()
+        _,pred,_ = model(data)
+        recon = model.unpatchify(pred)
+        loss = criterion(recon, labels)                                
+        loss.backward()
+        
+        # Gradient clipping per stabilità
+        if max_grad_norm is not None:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+        
+        optimizer.step()
+        
+        epoch_loss += loss.item()
+        step += 1
+    
+    if scheduler:
+        scheduler.step()
+    
+    epoch_loss /= step
+    return epoch_loss
+
 def train_one_epoch(model, loader, criterion, optimizer, device, scheduler, max_grad_norm=1.0):
     model.train()
     epoch_loss = 0
@@ -210,8 +340,9 @@ def testing(model, loader, device, dice_score, dice_score_T):
         for batch in tqdm(loader, desc="Testing"):
             data = batch['image'].to(device)
             labels = batch['mask'].to(device)
-            
-            outputs = model(data)
+            _,pred,_ = model(data)
+            outputs = model.unpatchify(pred)
+
             
             # Gestione output
             if outputs.dim() >= 4 and outputs.shape[1] > 1:
@@ -318,6 +449,51 @@ def validate_one_epoch(model, loader, criterion, device, dice_score, post_pred, 
     metric_T = np.mean(dice_scores_T) if dice_scores_T else 0.0
     return epoch_loss, metric, metric_T
 
+def validate_one_epoch_mod(model, loader, criterion, device, dice_score, post_pred, post_label, dice_score_T=None):
+    model.eval()
+    epoch_loss = 0
+    step = 0
+
+    dice_scores = []
+    dice_scores_T = []
+    with torch.no_grad():
+        for batch in tqdm(loader, desc="Validation"):
+            data = batch['image'].to(device)
+            labels = batch['mask'].to(device)
+            _,pred,_ = model(data)
+            outputs = model.unpatchify(pred)
+            loss = criterion(outputs, labels)    
+            epoch_loss += loss.item()
+            if outputs.dim() >= 4 and outputs.shape[1] > 1:
+                probs = torch.softmax(outputs, dim=1)
+                preds = torch.argmax(probs, dim=1, keepdim=True).float()
+    
+            for i in range(data.shape[0]):
+                # Get masks: [H, W]
+                gt_mask = labels[i, 0].long()  # [H, W]
+                pred_mask = preds[i, 0].long()  # [H, W]
+                
+                # Convert to one-hot: [H, W] -> [H, W, C] -> [C, H, W] -> [1, C, H, W]
+                gt_one_hot = torch.nn.functional.one_hot(gt_mask, num_classes=2).permute(2, 0, 1).unsqueeze(0).float()  # [1, 2, H, W]
+                pred_one_hot = torch.nn.functional.one_hot(pred_mask, num_classes=2).permute(2, 0, 1).unsqueeze(0).float()  # [1, 2, H, W]
+                
+                # dice_score: without background (only foreground class)
+                dice_i = dice_score(pred_one_hot, gt_one_hot)  # include_background=False
+                # Replace NaN with 1.0 (perfect score when class is absent in both GT and pred)
+                dice_i = torch.nan_to_num(dice_i, nan=1.0)
+                dice_scores.append(dice_i.mean().item())
+                
+                # dice_score_T: with background (both classes)
+                if dice_score_T is not None:
+                    dice_T = dice_score_T(pred_one_hot, gt_one_hot)  # include_background=True
+                    dice_T = torch.nan_to_num(dice_T, nan=1.0)
+                    dice_scores_T.append(dice_T.mean().item())
+            
+            step += 1
+    epoch_loss /= step
+    metric = np.mean(dice_scores) if dice_scores else 0.0
+    metric_T = np.mean(dice_scores_T) if dice_scores_T else 0.0
+    return epoch_loss, metric, metric_T
 
 def predict_and_plot(model, loader, device, post_pred, post_label, dice_metric):
     metric_sum = 0.0
@@ -359,7 +535,8 @@ def predict_and_plot(model, loader, device, post_pred, post_label, dice_metric):
         print(f"Dice score: {np.mean(metric):.4f}")
 
     return outputs, labels
-        
+
+
 def train_model(model, 
                 num_epochs, 
                 train_loader, 
@@ -386,8 +563,10 @@ def train_model(model,
     for epoch in range(start_epoch, num_epochs):
         epoch_start = time()
         
-        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device, scheduler, max_grad_norm=max_grad_norm)
-        val_loss, val_metric, val_metric_T = validate_one_epoch(model, test_loader, criterion, device, dice_metric, post_pred, post_label, dice_score_T=dice_metric_T)
+        #train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device, scheduler, max_grad_norm=max_grad_norm)
+        #val_loss, val_metric, val_metric_T = validate_one_epoch(model, test_loader, criterion, device, dice_metric, post_pred, post_label, dice_score_T=dice_metric_T)
+        train_loss = train_one_epoch_mod(model, train_loader, criterion, optimizer, device, scheduler, max_grad_norm=max_grad_norm)
+        val_loss, val_metric, val_metric_T = validate_one_epoch_mod(model, test_loader, criterion, device, dice_metric, post_pred, post_label, dice_score_T=dice_metric_T)
         epoch_time = time() - epoch_start
         
         

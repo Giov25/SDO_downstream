@@ -1009,4 +1009,7 @@ class MAE_Seg_Deformer(nn.Module):
         features = self.encoder(x)
         # Il decoder fa skip-connection e upsampling fino a 512x512
         mask = self.decoder(features)
+        # Allinea sempre la risoluzione dei logits a quella dell'input.
+        if mask.shape[-2:] != x.shape[-2:]:
+            mask = F.interpolate(mask, size=x.shape[-2:], mode='bilinear', align_corners=False)
         return mask

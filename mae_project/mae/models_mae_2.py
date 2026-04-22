@@ -83,7 +83,7 @@ class MaskedAutoencoderViT(nn.Module):
                  embed_dim=1024, depth=24, num_heads=16, n_img_mask = 1,
                  decoder_embed_dim=512, decoder_depth=8, decoder_num_heads=16,
                  mlp_ratio=4., norm_layer=nn.LayerNorm, norm_pix_loss=False, grid_size=3,
-                 mask_mode='spatial', use_channel_attention=False, num_channel_attn_blocks=2):
+                 mask_mode='spatial', use_channel_attention=False, num_channel_attn_blocks=2, out_chans=None):
         super().__init__()
 
         # Store grid size for masking logic
@@ -91,6 +91,7 @@ class MaskedAutoencoderViT(nn.Module):
         self.img_size = img_size
         self.patch_size = patch_size
         self.in_chans = in_chans
+        self.out_chans = out_chans if out_chans is not None else in_chans  # Default: same as input
         self.n_img_mask = n_img_mask
         self.embed_dim = embed_dim
         self.mask_mode = mask_mode  # 'spatial' or 'channel'
@@ -130,7 +131,7 @@ class MaskedAutoencoderViT(nn.Module):
             for i in range(decoder_depth)])
 
         self.decoder_norm = norm_layer(decoder_embed_dim)
-        self.decoder_pred = nn.Linear(decoder_embed_dim, patch_size**2 * in_chans, bias=True) # decoder to patch
+        self.decoder_pred = nn.Linear(decoder_embed_dim, patch_size**2 * self.out_chans, bias=True) # decoder to patch
         
         # --------------------------------------------------------------------------
         # Cross-channel attention blocks (opzionale, per mascheramento canali)
@@ -192,15 +193,19 @@ class MaskedAutoencoderViT(nn.Module):
         return x
 
 
-    def unpatchify(self, x):
+    def unpatchify(self, x, use_out_chans=True):
         """
         x: (N, L, patch_size**2 * C)
         imgs: (N, C, H, W)
+        
+        Args:
+            use_out_chans: se True, usa self.out_chans (per predizioni decoder)
+                          se False, usa self.in_chans (per patchify inverso)
         """
         p = self.patch_embed.patch_size[0]
         h = w = int(x.shape[1]**.5)
         assert h * w == x.shape[1]
-        c = self.in_chans # Use stored in_chans
+        c = self.out_chans if use_out_chans else self.in_chans
         x = x.reshape(shape=(x.shape[0], h, w, p, p, c))
         x = torch.einsum('nhwpqc->nchpwq', x)
         
@@ -415,9 +420,13 @@ class MaskedAutoencoderViT(nn.Module):
     def forward_loss(self, imgs, pred, mask):
         """
         imgs: [N, C, H, W]
-        pred: [N, L, p*p*C]
+        pred: [N, L, p*p*out_chans]
         mask: [N, L], 0 is keep, 1 is remove,
         """
+        # Se out_chans != in_chans, prendiamo solo i primi out_chans canali
+        if self.out_chans != self.in_chans:
+            imgs = imgs[:, :self.out_chans, :, :]
+        
         target = self.patchify(imgs)
         if self.norm_pix_loss:
             mean = target.mean(dim=-1, keepdim=True)
@@ -450,24 +459,66 @@ def mae_model_channel_masking_9ch_with_temporal_attn(**kwargs):
     img_size = kwargs.get('img_size', 1024)
     patch_size = kwargs.get('patch_size', 16)
     in_chans = kwargs.get('in_chans', 9)
+    out_chans = kwargs.get('out_chans', 2)  # Output: 2 canali
 
     model = MaskedAutoencoderViT(
-        img_size=img_size, 
-        patch_size=patch_size, 
-        embed_dim=768, 
-        depth=12, 
-        num_heads=12, 
+        img_size=img_size,
+        patch_size=patch_size,
+        embed_dim=768,
+        depth=12,
+        num_heads=12,
         n_img_mask=None,
-        decoder_embed_dim=512, 
-        decoder_depth=8, 
-        decoder_num_heads=16, 
+        decoder_embed_dim=512,
+        decoder_depth=8,
+        decoder_num_heads=16,
         in_chans=in_chans,
-        mlp_ratio=4, 
-        norm_layer=partial(nn.LayerNorm, eps=1e-6), 
-        norm_pix_loss=False, 
-        grid_size=2, 
-        mask_mode='channel', 
-        use_channel_attention=True, 
+        mlp_ratio=4,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6),
+        norm_pix_loss=False,
+        grid_size=2,
+        mask_mode='channel',
+        use_channel_attention=True,
+        num_channel_attn_blocks=3,
+        out_chans=out_chans  # 2 canali di output
+    )
+    return model
+
+def mae_model_fixed_channel_masking(**kwargs):
+    """MAE model con numero fisso di canali mascherati.
+
+    Args:
+        n_channels_to_mask (int): numero di canali da mascherare ad ogni forward pass.
+                                 Default: 3 (maschera 3 canali su 9).
+        img_size (int): dimensione dell'immagine. Default: 1024.
+        patch_size (int): dimensione della patch. Default: 16.
+        in_chans (int): numero totale di canali. Default: 9.
+    """
+    img_size = kwargs.get('img_size', 1024)
+    patch_size = kwargs.get('patch_size', 16)
+    in_chans = kwargs.get('in_chans', 9)
+    n_channels_masked = kwargs.get('n_channels_to_mask', 3)  # Corretto il nome del parametro
+
+    assert 1 <= n_channels_masked < in_chans, (
+        f"n_channels_masked ({n_channels_masked}) deve essere tra 1 e in_chans-1 ({in_chans - 1})"
+    )
+
+    model = MaskedAutoencoderViT(
+        img_size=img_size,
+        patch_size=patch_size,
+        embed_dim=768,
+        depth=12,
+        num_heads=12,
+        n_img_mask=n_channels_masked,  # valore fisso: non verrà randomizzato
+        decoder_embed_dim=512,
+        decoder_depth=8,
+        decoder_num_heads=16,
+        in_chans=in_chans,
+        mlp_ratio=4,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6),
+        norm_pix_loss=False,
+        grid_size=2,
+        mask_mode='channel',
+        use_channel_attention=True,
         num_channel_attn_blocks=3
     )
     return model

@@ -6,6 +6,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import wandb
 import os
+import monai
 from torch.utils.data import DataLoader
 from monai.metrics import DiceMetric
 from monai.losses import DiceCELoss
@@ -16,7 +17,7 @@ from unet_pytorch.model import UNet
 from models import MAE_UNet_Segmentation, MAE_Seg_Advanced, MAE_Seg_Deformer
 from mae.models_mae_2 import mae_model_channel_masking_9ch_with_temporal_attn
 from dataset import SDO_9Channel_Dataset
-from utils_2 import train_model  # Ensure this matches your project structure
+from utils_2 import train_model, load_checkpoint_with_channel_adaptation  # Ensure this matches your project structure
 from sunpy.map import Map
 def get_args():
     parser = argparse.ArgumentParser(description="SDO Segmentation Training and Inference")
@@ -24,7 +25,7 @@ def get_args():
     # Mode selection
     parser.add_argument('--mode', type=str, choices=['train', 'test', 'resume'], required=True, 
                         help="Run mode: 'train' to start training, 'test' to run inference.")
-    parser.add_argument('--model' , type=str, default='MAE_Seg_Deformer', help="Model architecture to use.")
+    parser.add_argument('--model' , type=str, default='MAE_2Channel', help="Model architecture to use.")
     # Paths
     
     parser.add_argument('--zarr_path', type=str, default="/home/gpatane/Dataset/zarr_file_magnetogram_1024_definitivo.zarr")
@@ -41,6 +42,7 @@ def get_args():
     parser.add_argument('--epochs', type=int, default=200)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--image_size', type=int, default=1024)
+    parser.add_argument('--loss', type=str, choices=['DiceCELoss', 'TwerskyLoss'], default='TwerskyLoss', help="Loss function to use.")
     parser.add_argument('--device', type=str, default="cuda:0")
     
     return parser.parse_args()
@@ -64,7 +66,48 @@ def setup_model(args, device):
         model = MAE_Seg_Advanced(mae_backbone, num_classes=2).to(device)
         for param in model.encoder.parameters():
             param.requires_grad = False
-            
+    
+    elif args.model == 'MAE_2Channel':
+        from utils_2 import load_checkpoint_with_channel_adaptation, freeze_encoder
+        import sys
+        sys.path.append('/home/gpatane/SDO_downstream/mae_project')
+        from mae.models_mae_2 import mae_model_channel_masking_9ch_with_temporal_attn
+        
+        # Crea il modello con 2 canali di output
+        model = mae_model_channel_masking_9ch_with_temporal_attn(out_chans=2)
+        
+        # Determina quale checkpoint caricare
+        checkpoint_to_load = None
+        if args.mode == 'test' and args.checkpoint_path:
+            # Per il test, usa il checkpoint salvato del modello
+            checkpoint_to_load = args.checkpoint_path
+            print(f"[MAE_2Channel] Test mode: carico da {checkpoint_to_load}")
+        elif args.load_pretrained:
+            # Per il training, usa il checkpoint MAE pretrained
+            checkpoint_to_load = args.mae_checkpoint
+            print(f"[MAE_2Channel] Train mode con pretrained: carico da {checkpoint_to_load}")
+        else:
+            # Training from scratch - nessun checkpoint
+            print(f"[MAE_2Channel] Training da zero (no pretrained)")
+        
+        # Se c'è un checkpoint da caricare
+        if checkpoint_to_load and os.path.exists(checkpoint_to_load):
+            model = load_checkpoint_with_channel_adaptation(
+                model, 
+                checkpoint_to_load, 
+                in_chans=9, 
+                out_chans=2, 
+                device=device
+            )
+        
+        # Applica freeze se richiesto
+        if args.freeze_encoder:
+            model = freeze_encoder(model)
+            print("[MAE_2Channel] ❄️  Encoder congelato")
+        
+        model = model.to(device)
+
+    
     elif args.model == 'MAE_Seg_Deformer':
         mae_backbone = mae_model_channel_masking_9ch_with_temporal_attn().to(device)
         
@@ -182,8 +225,10 @@ def main():
         model = setup_model(args, device)
         # 5. Optimizer & Criterion (Usano args.lr aggiornato)
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
-        criterion = DiceCELoss(to_onehot_y=True, softmax=True, lambda_dice=1.5, lambda_ce=1.0, include_background=False)
-        
+        if args.loss == 'DiceCELoss':
+            criterion = DiceCELoss(to_onehot_y=True, softmax=True, lambda_dice=1.5, lambda_ce=1.0, include_background=False)
+        elif args.loss == 'TwerskyLoss':
+            criterion = monai.losses.TverskyLoss(to_onehot_y=True, softmax=True, alpha=0.5, beta=0.5, include_background=False)
         dice_metric = DiceMetric(include_background=False, reduction="mean")
         dice_metric_T = DiceMetric(include_background=True, reduction="mean")
 

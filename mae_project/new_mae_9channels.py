@@ -34,7 +34,7 @@ def get_args():
     parser.add_argument("--decoder_embed_dim", type=int, default=512)
     
     # Hardware
-    parser.add_argument("--device", type=str, default="cuda:4" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--num_workers", type=int, default=4)
     
     # WandB
@@ -74,7 +74,7 @@ def train():
 
     # Optimizer & Scheduler
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.1)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
 
     # WandB Initialization
     wandb.init(
