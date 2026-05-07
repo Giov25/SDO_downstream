@@ -150,6 +150,11 @@ class MaskedAutoencoderViT(nn.Module):
 
         self.norm_pix_loss = norm_pix_loss
 
+        # Learned per-channel mask value (replaces zeros — avoids domain gap with downstream)
+        self.channel_mask_values = nn.Parameter(torch.zeros(in_chans))
+        # Spectral embedding: tells the encoder which wavelengths are visible
+        self.channel_embed = nn.Embedding(in_chans, embed_dim)
+
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -171,6 +176,7 @@ class MaskedAutoencoderViT(nn.Module):
 
         # initialize nn.Linear and nn.LayerNorm
         self.apply(self._init_weights)
+        nn.init.normal_(self.channel_embed.weight, std=0.02)
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -302,10 +308,10 @@ class MaskedAutoencoderViT(nn.Module):
         N, C, H, W = imgs.shape
         imgs_masked = imgs.clone()
         
-        # Maschera i canali selezionati impostando i loro valori a zero
+        # Sostituisce i canali mascherati con un valore appreso (evita domain gap)
         for channel_idx in channel_indices:
             if channel_idx < C:
-                imgs_masked[:, channel_idx, :, :] = 0
+                imgs_masked[:, channel_idx, :, :] = self.channel_mask_values[channel_idx]
         
         # Calcola la maschera a livello di patch
         # Poiché stiamo mascherando interi canali, tutte le patch sono parzialmente mascherate
@@ -345,10 +351,17 @@ class MaskedAutoencoderViT(nn.Module):
             
             # Embed patches dalle immagini mascherate
             x = self.patch_embed(x_masked)
-            
+
             # add pos embed w/o cls token
             x = x + self.pos_embed[:, 1:, :]
-            
+
+            # Spectral embedding: somma degli embedding dei canali visibili
+            visible_ids = [i for i in range(self.in_chans) if i not in channel_indices]
+            spectral_emb = self.channel_embed(
+                torch.tensor(visible_ids, dtype=torch.long, device=x.device)
+            ).sum(0)
+            x = x + spectral_emb[None, None, :]
+
             # Per il mascheramento dei canali, non rimuoviamo patch dall'encoder
             # quindi ids_restore è semplicemente l'identità
             ids_restore = torch.arange(x.shape[1], device=x.device).unsqueeze(0).repeat(x.shape[0], 1)
@@ -360,7 +373,12 @@ class MaskedAutoencoderViT(nn.Module):
 
             # add pos embed w/o cls token
             x = x + self.pos_embed[:, 1:, :]
-            
+
+            # Spectral embedding: tutti i canali visibili in modalità spaziale
+            all_ids = torch.arange(self.in_chans, dtype=torch.long, device=x.device)
+            spectral_emb = self.channel_embed(all_ids).sum(0)
+            x = x + spectral_emb[None, None, :]
+
             if n_img_mask is None:
                 n_img_mask = random.randint(1, 8)
             
@@ -442,6 +460,25 @@ class MaskedAutoencoderViT(nn.Module):
         pred = self.forward_decoder(latent, ids_restore, channel_indices)  # [N, L, p*p*C]
         loss = self.forward_loss(imgs, pred, mask)
         return loss, pred, mask
+
+    def forward_seg(self, imgs):
+        """Forward for segmentation — no channel masking, returns [B, out_chans, H, W]."""
+        N = imgs.shape[0]
+        x = self.patch_embed(imgs)
+        x = x + self.pos_embed[:, 1:, :]
+        # Spectral embedding: tutti i canali presenti a inference
+        all_ids = torch.arange(self.in_chans, dtype=torch.long, device=x.device)
+        spectral_emb = self.channel_embed(all_ids).sum(0)
+        x = x + spectral_emb[None, None, :]
+        ids_restore = torch.arange(x.shape[1], device=x.device).unsqueeze(0).repeat(N, 1)
+        cls_token = self.cls_token + self.pos_embed[:, :1, :]
+        cls_tokens = cls_token.expand(N, -1, -1)
+        x = torch.cat([cls_tokens, x], dim=1)
+        for blk in self.blocks:
+            x = blk(x)
+        x = self.norm(x)
+        pred = self.forward_decoder(x, ids_restore, channel_indices=None)
+        return self.unpatchify(pred)
 
 def mae_model_for_pretraining(**kwargs):            #random masking
     """ MAE model for pretraining with random masking

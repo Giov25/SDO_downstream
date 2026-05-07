@@ -1,23 +1,32 @@
 #!/bin/bash
-#SBATCH --job-name=prova_train
+#SBATCH --job-name=Seg_encoder_freeze_encoder
 #SBATCH --partition=gpu
-#SBATCH --qos=debug
-#SBATCH --gres=shard:1
+#SBATCH --qos=train
+#SBATCH --gres=gpu:1
 #SBATCH --output=%x-%j.out
 #SBATCH --error=%x-%j.err
 
-# ❄️  ESPERIMENTO 1: ENCODER FROZEN (Feature Extraction)
-# Carica i pesi pretrained dal task di ricostruzione MAE e FREEZA l'encoder
-# Solo il decoder viene allenato
+BEST_CKPT=/home/gpatane/checkpoints/Scratch_MAE_2Channel.pth
+LATEST_CKPT=/home/gpatane/checkpoints/Scratch_MAE_2Channel_latest.pth
 
-echo "🚀 Starting experiment..."
-#--mae_checkpoint /home/gpatane/SDO_downstream/mae_project/checkpoints/checkpoint_epoch55.pth \
-conda run -n SDOenv WANDB_MODE=disabled python prova_script_rapido.py \
-  --mode train \
-  --model MAE_2Channel \
-  --batch_size 8 \
-  --epochs 20 \
-  --lr 1e-4
-echo "Modello originale in segmentazione"
+if [ -f "$LATEST_CKPT" ]; then
+    MODE=resume
+    CHECKPOINT=$LATEST_CKPT
+else
+    MODE=train
+    CHECKPOINT=$BEST_CKPT
+fi
 
-#python prova_script_rapido.py --mode train --load_pretrained --freeze_encoder --model MAE_2Channel --batch_size 3 --epochs 200 --lr 1e-4
+echo "🚀 Starting experiment — mode: $MODE — checkpoint: $CHECKPOINT"
+
+conda run -n SDOenv python -u prova_script_rapido.py \
+    --mode $MODE \
+    --model MAE_2Channel \
+    --batch_size 8 \
+    --freeze_encoder \
+    --epochs 100 \
+    --lr 1e-4 \
+    --checkpoint_path $CHECKPOINT \
+    --mae_checkpoint /home/gpatane/SDO_downstream/mae_project/checkpoints/ch9_log1p/best_model.pth
+
+echo "✅ Done"

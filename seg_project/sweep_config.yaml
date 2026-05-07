@@ -1,32 +1,36 @@
-# config_sweep.yaml
-program: prova_script_rapido.py  
-method: bayes
+program: main.py
+method: bayes  # bayes è meglio di random/grid per spazi continui
+
 metric:
-  name: val/dice_score
+  name: val/dice
   goal: maximize
 
 parameters:
-  # Prova diversi learning rate in un range continuo (scala logaritmica)
+  # Iperparametri da cercare
   lr:
     distribution: log_uniform_values
     min: 1e-5
     max: 1e-3
-  
-  # Prova questi specifici batch size
+
   batch_size:
-    values: [8, 16]
+    values: [1, 2, 4]
 
-  # Puoi anche testare il numero di epoche o la dimensione immagine se vuoi
+  loss:
+    values: [DiceCELoss, TwerskyLoss]
+
   epochs:
-    value: 200
+    value: 100  # fisso durante lo sweep
 
-# Comandi fissi da passare a argparse
-command:
-  - ${env}
-  - python
-  - ${program}
-  - "--mode"
-  - "train"
-  - "--model"
-  - "MAE_UNet_Segmentation"
-  - ${args}
+  # Fissi — non variano nello sweep
+  model:
+    value: MAE_2Channel
+  image_size:
+    value: 512  # usa 512 durante lo sweep per velocità
+  device:
+    value: cuda:0
+  zarr_path:
+    value: /home/gpatane/Dataset/zarr_file_magnetogram_1024_definitivo.zarr
+  mae_checkpoint:
+    value: /home/gpatane/checkpoints/mae_ckp/best_model.pth
+  model_path:
+    value: /home/gpatane/checkpoints/sweep/

@@ -5,7 +5,7 @@ import math
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from tqdm import tqdm
 
 # Import dal tuo progetto
@@ -23,18 +23,21 @@ def get_args():
     parser = argparse.ArgumentParser(description="Training script for SDO MAE")
 
     # Path e Dataset
-    parser.add_argument("--zarr_path", type=str, default="/home/gpatane/Dataset/zarr_file_magnetogram.zarr")
+    parser.add_argument("--zarr_path", type=str, default="/home/gpatane/Dataset/zarr_file_magnetogram_1024_ORDINATO.zarr")
+    parser.add_argument("--json_stats", type=str, default="/home/gpatane/Dataset/statistiche_globali.json")
     parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints")
     parser.add_argument("--image_size", type=int, default=1024)
 
     # Hyperparameters Training
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1.5e-3)
     parser.add_argument("--min_lr", type=float, default=1e-6, help="LR minima per cosine scheduler")
     parser.add_argument("--warmup_epochs", type=int, default=5, help="Epoche di warmup lineare")
     parser.add_argument("--weight_decay", type=float, default=0.05)
     parser.add_argument("--grad_clip", type=float, default=1.0, help="Max norm per gradient clipping (0 = disabilitato)")
+    parser.add_argument("--accum_steps", type=int, default=8, help="Gradient accumulation steps (batch_size_effettivo = batch_size * accum_steps)")
+    parser.add_argument("--mask_ratio", type=float, default=0.3, help="Frazione di patch spaziali rimosse dall'encoder")
     parser.add_argument("--save_every", type=int, default=5)
     parser.add_argument("--seed", type=int, default=1)
 
@@ -56,6 +59,7 @@ def get_args():
     parser.add_argument("--wandb_enabled", action="store_true", help="Abilita il logging su Weights & Biases")
     parser.add_argument("--wandb_project", type=str, default="mae-sdo")
     parser.add_argument("--wandb_run_name", type=str, default="mae_9channels_masking_DGX")
+    parser.add_argument("--wandb_run_id", type=str, default=None, help="Run ID WandB per riprendere la stessa run")
 
     return parser.parse_args()
 
@@ -99,23 +103,26 @@ def load_checkpoint(path, model, optimizer, scheduler, device):
             optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         start_epoch = ckpt.get("epoch", 0)
         best_val_loss = ckpt.get("best_val_loss", float("inf"))
+        wandb_run_id = ckpt.get("wandb_run_id", None)
         print(f"[Resume] Riparto dall'epoca {start_epoch + 1}, best val loss = {best_val_loss:.4f}")
     else:
         # Checkpoint legacy (solo state_dict)
         model.load_state_dict(ckpt)
         start_epoch = 0
         best_val_loss = float("inf")
+        wandb_run_id = None
         print("[Resume] Checkpoint legacy (solo pesi), riparto dall'epoca 1")
 
-    return start_epoch, best_val_loss
+    return start_epoch, best_val_loss, wandb_run_id
 
 
-def save_checkpoint(path, model, optimizer, epoch, best_val_loss):
+def save_checkpoint(path, model, optimizer, epoch, best_val_loss, wandb_run_id=None):
     torch.save({
         "epoch": epoch,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "best_val_loss": best_val_loss,
+        "wandb_run_id": wandb_run_id,
     }, path)
 
 
@@ -138,8 +145,8 @@ def train():
     g = torch.Generator()
     g.manual_seed(args.seed)
 
-    train_dataset = SDO_Dataset_channels_FAST(args.zarr_path, train_years, wavelengths, target_size=args.image_size)
-    val_dataset   = SDO_Dataset_channels_FAST(args.zarr_path, val_years,   wavelengths, target_size=args.image_size)
+    train_dataset = SDO_Dataset_channels_FAST(args.zarr_path, args.json_stats, train_years, wavelengths, target_size=args.image_size)
+    val_dataset   = SDO_Dataset_channels_FAST(args.zarr_path, args.json_stats, val_years,   wavelengths, target_size=args.image_size)
 
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True,
@@ -156,6 +163,7 @@ def train():
         img_size=args.image_size,
         patch_size=args.patch_size,
         in_chans=len(wavelengths),
+        mask_ratio=args.mask_ratio,
     ).to(args.device)
     import subprocess
     result = subprocess.run(['nvidia-smi', '--query-gpu=index,uuid', '--format=csv,noheader'], capture_output=True, text=True)
@@ -175,26 +183,42 @@ def train():
     )
 
     # Mixed precision scaler
-    scaler = GradScaler(enabled=args.mixed_precision)
+    scaler = GradScaler("cuda", enabled=args.mixed_precision)
 
     # Resume
     start_epoch = 0
     best_val_loss = float("inf")
+    wandb_run_id = args.wandb_run_id
     if args.resume_from is not None:
-        start_epoch, best_val_loss = load_checkpoint(
+        start_epoch, best_val_loss, ckpt_run_id = load_checkpoint(
             args.resume_from, model, optimizer, None, args.device
         )
+        if wandb_run_id is None:
+            wandb_run_id = ckpt_run_id
 
     # WandB init
     if use_wandb:
         wandb.init(
             project=args.wandb_project,
             name=f"{args.wandb_run_name}_{args.image_size}",
+            id=wandb_run_id,
             config=vars(args),
             resume="allow",
         )
+        wandb_run_id = wandb.run.id
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
+
+    # Flash Attention (PyTorch >= 2.0): riduce memoria dell'attention da O(n²) a O(n)
+    # Fondamentale con 4096 patch (1024px / patch_size=16)
+    if torch.cuda.is_available():
+        torch.backends.cuda.enable_flash_sdp(True)
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
+
+    effective_batch = args.batch_size * args.accum_steps
+    n_patches = (args.image_size // args.patch_size) ** 2
+    print(f"[Info] Patch per immagine: {n_patches} ({args.image_size}px / patch {args.patch_size}px)")
+    print(f"[Info] Batch size effettivo: {effective_batch} ({args.batch_size} × {args.accum_steps} accum steps)")
 
     # ------------------------------------------------------------------ #
     #  Training loop                                                       #
@@ -212,32 +236,45 @@ def train():
         total_grad_norm  = 0.0
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Train]")
+        optimizer.zero_grad()
+        grad_norm = 0.0
+        n_optimizer_steps = 0
         for step, batch in enumerate(pbar):
-            batch = batch.to(args.device, non_blocking=True)
+            img, date = batch  # date è una lista di stringhe con le date corrispondenti
+            img = img.to(args.device, non_blocking=True)
+            is_last_accum = (step + 1) % args.accum_steps == 0 or (step + 1) == len(train_loader)
 
-            optimizer.zero_grad()
-
-            with autocast(enabled=args.mixed_precision):
-                loss, _, _ = model(batch)
+            with autocast("cuda", enabled=args.mixed_precision):
+                loss, _, _ = model(img)
+                loss = loss / args.accum_steps
 
             scaler.scale(loss).backward()
 
-            # Gradient clipping
-            grad_norm = 0.0
-            if args.grad_clip > 0:
-                scaler.unscale_(optimizer)
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip).item()
+            if is_last_accum:
+                if args.grad_clip > 0:
+                    scaler.unscale_(optimizer)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip).item()
 
-            scaler.step(optimizer)
-            scaler.update()
+                # scaler.step salta l'update se ci sono NaN/inf nei gradienti
+                scale_before = scaler.get_scale()
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
 
-            total_train_loss += loss.item()
-            total_grad_norm  += grad_norm
+                # conta lo step solo se il scaler non ha saltato (nessun overflow)
+                if scaler.get_scale() >= scale_before:
+                    if math.isfinite(grad_norm):
+                        total_grad_norm += grad_norm
+                    n_optimizer_steps += 1
 
-            pbar.set_postfix({"loss": f"{loss.item():.4f}", "grad": f"{grad_norm:.2f}", "lr": f"{current_lr:.2e}"})
+            loss_val = loss.item() * args.accum_steps
+            if math.isfinite(loss_val):
+                total_train_loss += loss_val
 
-        avg_train_loss = total_train_loss / len(train_loader)
-        avg_grad_norm  = total_grad_norm  / len(train_loader)
+            pbar.set_postfix({"loss": f"{loss_val:.4f}", "grad": f"{grad_norm:.2f}", "lr": f"{current_lr:.2e}"})
+
+        avg_train_loss = total_train_loss / max(1, len(train_loader))
+        avg_grad_norm  = total_grad_norm  / max(1, n_optimizer_steps)
 
         # ---- VAL ----
         model.eval()
@@ -246,9 +283,10 @@ def train():
         with torch.no_grad():
             pbar_val = tqdm(val_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Val]")
             for batch in pbar_val:
-                batch = batch.to(args.device, non_blocking=True)
-                with autocast(enabled=args.mixed_precision):
-                    loss, _, _ = model(batch)
+                img, date = batch
+                img = img.to(args.device, non_blocking=True)
+                with autocast("cuda", enabled=args.mixed_precision):
+                    loss, _, _ = model(img)
                 total_val_loss += loss.item()
                 pbar_val.set_postfix({"loss": f"{loss.item():.4f}"})
 
@@ -271,15 +309,15 @@ def train():
             best_val_loss = avg_val_loss
             save_checkpoint(
                 os.path.join(args.checkpoint_dir, "best_model.pth"),
-                model, optimizer, epoch, best_val_loss,
+                model, optimizer, epoch, best_val_loss, wandb_run_id,
             )
             print(f"  → Nuovo best model salvato (val loss: {best_val_loss:.4f})")
 
-        if (epoch + 1) % args.save_every == 0:
-            save_checkpoint(
-                os.path.join(args.checkpoint_dir, f"checkpoint_epoch{epoch+1}.pth"),
-                model, optimizer, epoch, best_val_loss,
-            )
+        #if (epoch + 1) % args.save_every == 0:
+        save_checkpoint(
+            os.path.join(args.checkpoint_dir, f"checkpoint_epoch{epoch+1}.pth"),
+            model, optimizer, epoch, best_val_loss, wandb_run_id,
+        )
 
     if use_wandb:
         wandb.finish()

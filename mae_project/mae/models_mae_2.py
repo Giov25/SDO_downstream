@@ -13,6 +13,8 @@ from functools import partial
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from timm.models.vision_transformer import PatchEmbed, Block
 import random
@@ -39,41 +41,16 @@ class CrossChannelAttentionBlock(nn.Module):
         self.norm = nn.LayerNorm(dim)
 
     def forward(self, x, channel_mask=None):
-        """
-        Args:
-            x: [B, N, D] - input features (N = num_patches)
-            channel_mask: [B, in_chans] - binary mask (1 = canale visibile, 0 = mascherato)
-        
-        Returns:
-            x: [B, N, D] - output features con attenzione cross-channel applicata
-        """
         B, N, D = x.shape
-        
-        # Layer norm
         x_norm = self.norm(x)
-        
-        # QKV projection
         qkv = self.qkv(x_norm).reshape(B, N, 3, self.num_heads, D // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)  # [B, num_heads, N, head_dim]
-        
-        # Attention
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        
-        # Opzionalmente, applica maschera per impedire attenzione ai canali mascherati
-        # (questo è più complesso e richiede reshaping per canali)
-        
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-        
-        # Apply attention
-        x_attn = (attn @ v).transpose(1, 2).reshape(B, N, D)
+        q, k, v = qkv.unbind(0)
+        dropout_p = self.attn_drop.p if self.training else 0.0
+        x_attn = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+        x_attn = x_attn.transpose(1, 2).reshape(B, N, D)
         x_attn = self.proj(x_attn)
         x_attn = self.proj_drop(x_attn)
-        
-        # Residual connection
-        x = x + x_attn
-        
-        return x
+        return x + x_attn
 
 
 class MaskedAutoencoderViT(nn.Module):
@@ -83,7 +60,8 @@ class MaskedAutoencoderViT(nn.Module):
                  embed_dim=1024, depth=24, num_heads=16, n_img_mask = 1,
                  decoder_embed_dim=512, decoder_depth=8, decoder_num_heads=16,
                  mlp_ratio=4., norm_layer=nn.LayerNorm, norm_pix_loss=False, grid_size=3,
-                 mask_mode='spatial', use_channel_attention=False, num_channel_attn_blocks=2, out_chans=None):
+                 mask_mode='spatial', use_channel_attention=False, num_channel_attn_blocks=2, out_chans=None,
+                 mask_ratio=0.75):
         super().__init__()
 
         # Store grid size for masking logic
@@ -94,6 +72,7 @@ class MaskedAutoencoderViT(nn.Module):
         self.out_chans = out_chans if out_chans is not None else in_chans  # Default: same as input
         self.n_img_mask = n_img_mask
         self.embed_dim = embed_dim
+        self.mask_ratio = mask_ratio
         self.mask_mode = mask_mode  # 'spatial' or 'channel'
         self.use_channel_attention = use_channel_attention
 
@@ -150,6 +129,11 @@ class MaskedAutoencoderViT(nn.Module):
 
         self.norm_pix_loss = norm_pix_loss
 
+        # Learned per-channel mask value (replaces zeros — avoids domain gap with downstream)
+        self.channel_mask_values = nn.Parameter(torch.zeros(in_chans))
+        # Spectral embedding: tells the encoder which wavelengths are visible
+        self.channel_embed = nn.Embedding(in_chans, embed_dim)
+
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -167,6 +151,7 @@ class MaskedAutoencoderViT(nn.Module):
 
         # initialize nn.Linear and nn.LayerNorm
         self.apply(self._init_weights)
+        nn.init.normal_(self.channel_embed.weight, std=0.02)
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -282,47 +267,39 @@ class MaskedAutoencoderViT(nn.Module):
             x, dim=1, index=ids_keep.unsqueeze(-1).expand(-1, -1, D)
         )
         
-        # Crea ids_restore per il decoder 
-        ids_restore = torch.arange(L, device=x.device).unsqueeze(0).repeat(N, 1)
+        # Correct ids_restore: [kept_indices | masked_indices] → argsort = inverse permutation
+        ids_masked = all_target_patch_indices  # sorted (torch.unique returns sorted)
+        ids_shuffle = torch.cat([ids_keep_first, ids_masked], dim=0)   # [L]
+        ids_restore = torch.argsort(ids_shuffle).unsqueeze(0).repeat(N, 1)  # [N, L]
 
         return x_masked, mask, ids_restore
 
+    def random_masking(self, x, mask_ratio):
+        """Spatial masking casuale: rimuove mask_ratio patch dall'encoder."""
+        N, L, D = x.shape
+        len_keep = int(L * (1 - mask_ratio))
+
+        noise = torch.rand(N, L, device=x.device)
+        ids_shuffle = torch.argsort(noise, dim=1)
+        ids_restore = torch.argsort(ids_shuffle, dim=1)
+
+        ids_keep = ids_shuffle[:, :len_keep]
+        x_kept = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).expand(-1, -1, D))
+
+        mask = torch.ones([N, L], device=x.device)
+        mask[:, :len_keep] = 0
+        mask = torch.gather(mask, dim=1, index=ids_restore)
+
+        return x_kept, mask, ids_restore
+
     def mask_specific_channels(self, imgs, channel_indices):
-        """
-        Maschera specifici canali dell'immagine impostando i loro valori a zero prima dell'embedding
-        
-        Args:
-            imgs: [N, C, H, W] - input images
-            channel_indices: list - indici dei canali da mascherare
-        
-        Returns:
-            imgs_masked: [N, C, H, W] - immagini con canali mascherati
-            mask: [N, L] - maschera binaria (1 = mascherato, 0 = visibile)
-        """
-        N, C, H, W = imgs.shape
+        """Sostituisce i canali mascherati con un valore appreso (evita domain gap con il downstream)."""
         imgs_masked = imgs.clone()
-        
-        # Maschera i canali selezionati impostando i loro valori a zero
-        for channel_idx in channel_indices:
-            if channel_idx < C:
-                imgs_masked[:, channel_idx, :, :] = 0
-        
-        # Calcola la maschera a livello di patch
-        # Poiché stiamo mascherando interi canali, tutte le patch sono parzialmente mascherate
-        # ma possiamo creare una maschera che indica quali patch contengono canali mascherati
-        num_patches = (H // self.patch_size) * (W // self.patch_size)
-        
-        # Opzione 1: Tutte le patch sono considerate mascherate (perché contengono canali mascherati)
-        # mask = torch.ones([N, num_patches], device=imgs.device)
-        
-        # Opzione 2: Maschera solo se TUTTI i canali sono mascherati (più conservativa)
-        if len(channel_indices) == C:
-            mask = torch.ones([N, num_patches], device=imgs.device)
-        else:
-            # Solo una frazione dei canali è mascherata, quindi calcoliamo una maschera proporzionale
-            mask = torch.ones([N, num_patches], device=imgs.device) * (len(channel_indices) / C)
-        
-        return imgs_masked, mask
+        C = imgs.shape[1]
+        for idx in channel_indices:
+            if idx < C:
+                imgs_masked[:, idx, :, :] = self.channel_mask_values[idx]
+        return imgs_masked
 
 
 
@@ -333,25 +310,23 @@ class MaskedAutoencoderViT(nn.Module):
         channel_indices = None
         
         if self.mask_mode == 'channel':
-            # Modalità mascheramento canali
             if n_img_mask is None:
                 n_img_mask = random.randint(1, self.in_chans - 1)
-            
-            # Seleziona casualmente i canali da mascherare
             channel_indices = random.sample(range(self.in_chans), n_img_mask)
-            
-            # Maschera i canali prima dell'embedding
-            x_masked, mask = self.mask_specific_channels(x, channel_indices)
-            
-            # Embed patches dalle immagini mascherate
-            x = self.patch_embed(x_masked)
-            
-            # add pos embed w/o cls token
+
+            # Sostituisce i canali mascherati con il valore appreso, poi embedd
+            x = self.patch_embed(self.mask_specific_channels(x, channel_indices))
             x = x + self.pos_embed[:, 1:, :]
-            
-            # Per il mascheramento dei canali, non rimuoviamo patch dall'encoder
-            # quindi ids_restore è semplicemente l'identità
-            ids_restore = torch.arange(x.shape[1], device=x.device).unsqueeze(0).repeat(x.shape[0], 1)
+
+            # Spectral embedding: somma degli embedding dei canali visibili
+            visible_ids = [i for i in range(self.in_chans) if i not in channel_indices]
+            spectral_emb = self.channel_embed(
+                torch.tensor(visible_ids, dtype=torch.long, device=x.device)
+            ).sum(0)  # (embed_dim,)
+            x = x + spectral_emb[None, None, :]
+
+            # Spatial masking per efficienza encoder: riduce la sequenza di mask_ratio
+            x, mask, ids_restore = self.random_masking(x, self.mask_ratio)
             
         else:  # mask_mode == 'spatial'
             # Modalità mascheramento spaziale (originale)
@@ -360,24 +335,27 @@ class MaskedAutoencoderViT(nn.Module):
 
             # add pos embed w/o cls token
             x = x + self.pos_embed[:, 1:, :]
-            
+
+            # Spectral embedding: tutti i canali visibili in modalità spaziale
+            all_ids = torch.arange(self.in_chans, dtype=torch.long, device=x.device)
+            spectral_emb = self.channel_embed(all_ids).sum(0)
+            x = x + spectral_emb[None, None, :]
+
             if n_img_mask is None:
-                n_img_mask = random.randint(1, 8)
-            
-            # Scegli casualmente le sotto-immagini da mascherare
-            channel_indices = random.sample(range(0, 8), n_img_mask)
-            
-            # Maschera le sotto-immagini specifiche
-            x, mask, ids_restore = self.mask_specific_subgrid(x, channel_indices)
+                n_img_mask = random.randint(1, self.grid_size ** 2)
+
+            subgrid_indices = random.sample(range(self.grid_size ** 2), n_img_mask)
+            x, mask, ids_restore = self.mask_specific_subgrid(x, subgrid_indices)
+            channel_indices = None  # spatial mode: no channel masking
         
         # append cls token
         cls_token = self.cls_token + self.pos_embed[:, :1, :]
         cls_tokens = cls_token.expand(x.shape[0], -1, -1)
         x = torch.cat((cls_tokens, x), dim=1)
 
-        # apply Transformer blocks
+        # apply Transformer blocks (gradient checkpointing per risparmiare VRAM con sequenze lunghe)
         for blk in self.blocks:
-            x = blk(x)
+            x = checkpoint(blk, x, use_reentrant=False)
         x = self.norm(x)
 
         return x, mask, ids_restore, channel_indices
@@ -399,7 +377,7 @@ class MaskedAutoencoderViT(nn.Module):
 
         # apply Transformer blocks
         for blk in self.decoder_blocks:
-            x = blk(x)
+            x = checkpoint(blk, x, use_reentrant=False)
         
         # Applica cross-channel attention se abilitato e in modalità channel masking
         if self.use_channel_attention and self.channel_attn_blocks is not None and channel_indices is not None:
@@ -417,33 +395,43 @@ class MaskedAutoencoderViT(nn.Module):
 
         return x
 
-    def forward_loss(self, imgs, pred, mask):
+    def forward_loss(self, imgs, pred, channel_indices, spatial_mask):
         """
         imgs: [N, C, H, W]
-        pred: [N, L, p*p*out_chans]
-        mask: [N, L], 0 is keep, 1 is remove,
+        pred: [N, L, p²*C]
+        channel_indices: canali mascherati (None in spatial masking mode)
+        spatial_mask: [N, L], 1 = patch mascherata
         """
-        # Se out_chans != in_chans, prendiamo solo i primi out_chans canali
-        if self.out_chans != self.in_chans:
-            imgs = imgs[:, :self.out_chans, :, :]
-        
-        target = self.patchify(imgs)
+        target = self.patchify(imgs)  # [N, L, p²*C]
         if self.norm_pix_loss:
             mean = target.mean(dim=-1, keepdim=True)
             var = target.var(dim=-1, keepdim=True)
             target = (target - mean) / (var + 1.e-6)**.5
 
-        loss = (pred - target) ** 2
-        loss = loss.mean(dim=-1)  # [N, L], mean loss per patch
+        loss = (pred - target) ** 2  # [N, L, p²*C]
 
-        loss = (loss * mask).sum() / mask.sum()  # mean loss on removed patches
-        return loss
+        if self.mask_mode == 'channel' and channel_indices is not None:
+            # Loss solo sui canali mascherati, su tutte le posizioni spaziali.
+            # I canali sono azzerate ovunque → task: ricostruire il canale mancante
+            # su ogni posizione usando i canali visibili.
+            p = self.patch_embed.patch_size[0]
+            C = self.in_chans
+            ch_weight = torch.zeros(C, device=imgs.device)
+            for idx in channel_indices:
+                ch_weight[idx] = 1.0
+            ch_weight = ch_weight.repeat(p * p)  # [p²*C]
+            loss = (loss * ch_weight).sum(dim=-1) / ch_weight.sum()  # [N, L]
+            return loss.mean()
+        else:
+            # Spatial masking mode: loss solo sulle patch mascherate, tutti i canali
+            loss = loss.mean(dim=-1)  # [N, L]
+            return (loss * spatial_mask).sum() / spatial_mask.sum()
 
     def forward(self, imgs, n_img_mask=None):
-        latent, mask, ids_restore, channel_indices = self.forward_encoder(imgs, n_img_mask)
-        pred = self.forward_decoder(latent, ids_restore, channel_indices)  # [N, L, p*p*C]
-        loss = self.forward_loss(imgs, pred, mask)
-        return loss, pred, mask
+        latent, spatial_mask, ids_restore, channel_indices = self.forward_encoder(imgs, n_img_mask)
+        pred = self.forward_decoder(latent, ids_restore, channel_indices)  # [N, L, p²*C]
+        loss = self.forward_loss(imgs, pred, channel_indices, spatial_mask)
+        return loss, pred, spatial_mask
 
 def mae_model_for_pretraining(**kwargs):            #random masking
     """ MAE model for pretraining with random masking
@@ -455,11 +443,10 @@ def mae_model_for_pretraining(**kwargs):            #random masking
     return model
 
 def mae_model_channel_masking_9ch_with_temporal_attn(**kwargs):
-    # Estrai i parametri dai kwargs, usando i tuoi vecchi valori come default
     img_size = kwargs.get('img_size', 1024)
     patch_size = kwargs.get('patch_size', 16)
     in_chans = kwargs.get('in_chans', 9)
-    out_chans = kwargs.get('out_chans', 2)  # Output: 2 canali
+    mask_ratio = kwargs.get('mask_ratio', 0.75)
 
     model = MaskedAutoencoderViT(
         img_size=img_size,
@@ -479,7 +466,7 @@ def mae_model_channel_masking_9ch_with_temporal_attn(**kwargs):
         mask_mode='channel',
         use_channel_attention=True,
         num_channel_attn_blocks=3,
-        out_chans=out_chans  # 2 canali di output
+        mask_ratio=mask_ratio,
     )
     return model
 

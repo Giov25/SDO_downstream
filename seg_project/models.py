@@ -1013,3 +1013,49 @@ class MAE_Seg_Deformer(nn.Module):
         if mask.shape[-2:] != x.shape[-2:]:
             mask = F.interpolate(mask, size=x.shape[-2:], mode='bilinear', align_corners=False)
         return mask
+
+
+class MAE_FrozenEncoderSeg(nn.Module):
+    """
+    Modello MAE di ricostruzione adattato per la segmentazione downstream.
+
+    L'encoder (patch_embed, blocks, norm) viene inizializzato con i pesi
+    pretrained e opzionalmente congelato per dimostrare il trasferimento
+    pretrain → downstream. Solo il decoder (e l'head finale) viene allenato.
+
+    Differenza chiave rispetto all'uso diretto del MAE: viene disabilitato
+    il channel-masking durante il forward, poiché per la segmentazione
+    tutti i canali di input devono essere visibili.
+    """
+
+    def __init__(self, mae_model, freeze_encoder=True):
+        super().__init__()
+        self.mae = mae_model
+
+        if freeze_encoder:
+            self._freeze_encoder()
+
+    def _freeze_encoder(self):
+        for param in self.mae.patch_embed.parameters():
+            param.requires_grad = False
+        self.mae.pos_embed.requires_grad = False
+        self.mae.cls_token.requires_grad = False
+        for param in self.mae.blocks.parameters():
+            param.requires_grad = False
+        for param in self.mae.norm.parameters():
+            param.requires_grad = False
+
+        total = sum(p.numel() for p in self.mae.parameters())
+        trainable = sum(p.numel() for p in self.mae.parameters() if p.requires_grad)
+        print(f"Encoder congelato — parametri trainabili: {trainable:,} / {total:,}")
+
+    def unpatchify(self, x):
+        return self.mae.unpatchify(x)
+
+    def forward(self, x):
+        # n_img_mask=0: nessun canale mascherato, l'encoder vede tutto l'input
+        latent, mask, ids_restore, _ = self.mae.forward_encoder(x, n_img_mask=0)
+        pred = self.mae.forward_decoder(latent, ids_restore)
+        # Restituisce (None, pred_patches, mask) per compatibilità con
+        # train_one_epoch_mod / validate_one_epoch_mod
+        return None, pred, mask

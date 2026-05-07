@@ -6,6 +6,8 @@
 *.pdf
 *.json
 *.wandb
+*.out
+*.err
 
 
 # Escludi cartelle di sistema di Python

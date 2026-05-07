@@ -138,9 +138,7 @@ def log_predictions_to_wandb(model, test_loader, device, num_images=6, epoch=0, 
             inputs = batch_data["image"].to(device)
             labels = batch_data["mask"].to(device)
             
-            #outputs = model(inputs)  # [B, 2, H, W] logits
-            _,pred,_ = model(inputs)
-            outputs = model.unpatchify(pred)
+            outputs = _forward_to_image(model, inputs)
             
             
             # Converti logits in probabilità con softmax
@@ -269,6 +267,18 @@ def load_checkpoint_with_channel_adaptation(model, checkpoint_path, in_chans=9, 
     return model
 
 
+def _forward_to_image(model, data):
+    """Chiama model(data) e restituisce sempre un tensore [B, C, H, W].
+    Usa forward_seg se disponibile (nessun channel masking, deterministic)."""
+    if hasattr(model, 'forward_seg'):
+        return model.forward_seg(data)
+    out = model(data)
+    if isinstance(out, tuple):
+        _, pred, _ = out
+        return model.unpatchify(pred)
+    return out
+
+
 def train_one_epoch_mod(model, loader, criterion, optimizer, device, scheduler, max_grad_norm=1.0):
     model.train()
     epoch_loss = 0
@@ -278,23 +288,19 @@ def train_one_epoch_mod(model, loader, criterion, optimizer, device, scheduler, 
         data = batch['image'].to(device)
         labels = batch['mask'].to(device)
         optimizer.zero_grad()
-        _,pred,_ = model(data)
-        recon = model.unpatchify(pred)
-        loss = criterion(recon, labels)                                
+        recon = _forward_to_image(model, data)
+        loss = criterion(recon, labels)
         loss.backward()
-        
+
         # Gradient clipping per stabilità
         if max_grad_norm is not None:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-        
+
         optimizer.step()
-        
+
         epoch_loss += loss.item()
         step += 1
-    
-    if scheduler:
-        scheduler.step()
-    
+
     epoch_loss /= step
     return epoch_loss
 
@@ -309,21 +315,18 @@ def train_one_epoch(model, loader, criterion, optimizer, device, scheduler, max_
         optimizer.zero_grad()
         outputs = model(data)
 
-        loss = criterion(outputs, labels)                                
+        loss = criterion(outputs, labels)
         loss.backward()
-        
+
         # Gradient clipping per stabilità
         if max_grad_norm is not None:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-        
+
         optimizer.step()
-        
+
         epoch_loss += loss.item()
         step += 1
-    
-    if scheduler:
-        scheduler.step()
-    
+
     epoch_loss /= step
     return epoch_loss
 
@@ -340,8 +343,7 @@ def testing(model, loader, device, dice_score, dice_score_T):
         for batch in tqdm(loader, desc="Testing"):
             data = batch['image'].to(device)
             labels = batch['mask'].to(device)
-            _,pred,_ = model(data)
-            outputs = model.unpatchify(pred)
+            outputs = _forward_to_image(model, data)
 
             
             # Gestione output
@@ -460,9 +462,8 @@ def validate_one_epoch_mod(model, loader, criterion, device, dice_score, post_pr
         for batch in tqdm(loader, desc="Validation"):
             data = batch['image'].to(device)
             labels = batch['mask'].to(device)
-            _,pred,_ = model(data)
-            outputs = model.unpatchify(pred)
-            loss = criterion(outputs, labels)    
+            outputs = _forward_to_image(model, data)
+            loss = criterion(outputs, labels)
             epoch_loss += loss.item()
             if outputs.dim() >= 4 and outputs.shape[1] > 1:
                 probs = torch.softmax(outputs, dim=1)
@@ -537,112 +538,64 @@ def predict_and_plot(model, loader, device, post_pred, post_label, dice_metric):
     return outputs, labels
 
 
-def train_model(model, 
-                num_epochs, 
-                train_loader, 
-                test_loader, 
-                criterion, 
-                optimizer, 
-                device, 
-                scheduler, 
-                dice_metric, 
+def train_model(model,
+                num_epochs,
+                train_loader,
+                test_loader,
+                criterion,
+                optimizer,
+                device,
+                scheduler,
+                dice_metric,
                 dice_metric_T,
-                post_pred, 
+                post_pred,
                 post_label,
                 model_save_path=None,
                 wandb_run=None,
                 max_grad_norm=1.0,
-                log_images_every=5,  # Log predictions ogni N epochs
-                start_epoch=0,  # Epoca da cui riprendere
-                best_dice=0.0  # Miglior dice score precedente
+                log_images_every=5,
+                start_epoch=0,
+                best_dice=0.0
                 ):
     train_losses, val_losses, val_dice_scores, val_dice_scores_T = [], [], [], []
     max_validation = best_dice
     since = time()
-    
+
+    # Checkpoint "latest" salvato ogni epoca per supportare il resume
+    if model_save_path:
+        latest_save_path = model_save_path.replace('.pth', '_latest.pth')
+    else:
+        latest_save_path = None
+
     for epoch in range(start_epoch, num_epochs):
         epoch_start = time()
-        
-        #train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device, scheduler, max_grad_norm=max_grad_norm)
-        #val_loss, val_metric, val_metric_T = validate_one_epoch(model, test_loader, criterion, device, dice_metric, post_pred, post_label, dice_score_T=dice_metric_T)
+
         train_loss = train_one_epoch_mod(model, train_loader, criterion, optimizer, device, scheduler, max_grad_norm=max_grad_norm)
         val_loss, val_metric, val_metric_T = validate_one_epoch_mod(model, test_loader, criterion, device, dice_metric, post_pred, post_label, dice_score_T=dice_metric_T)
         epoch_time = time() - epoch_start
-        
-        
+
         if scheduler:
             scheduler.step()
-        
+
         current_lr = optimizer.param_groups[0]['lr']
-        
-        # Log to wandb: log the current epoch's losses (not cumulative mean)
+
         if wandb_run:
             log_dict = {
                 "epoch": epoch + 1,
-                "train/loss": float(train_loss),      # valore per epoca
+                "train/loss": float(train_loss),
                 "val/loss": float(val_loss),
                 "val/dice_score": float(val_metric),
                 "val/dice_score_T": float(val_metric_T),
                 "learning_rate": float(current_lr),
                 "epoch_time": float(epoch_time)
             }
-            # Usa epoch come step per avere le epoche sull'asse X
             wandb.log(log_dict)
-            
-            # Log predictions every N epochs
+
             if (epoch + 1) % log_images_every == 0 or epoch == 0:
                 print(f"  Logging predictions to wandb...")
                 log_predictions_to_wandb(model, test_loader, device, num_images=6, epoch=epoch+1, phase="validation", dice_metric=dice_metric)
-        
-        # Save best model
-        if val_metric > max_validation:
-            max_validation = val_metric
-            if model_save_path:
-                os.makedirs(os.path.dirname(model_save_path), exist_ok=True)
-                print(f"\n  New best model found! Saving model to {model_save_path} ...")
-                checkpoint_data = {
-                    'epoch': epoch + 1,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-                    'train_loss': train_loss,
-                    'val_loss': val_loss,
-                    'val_dice': val_metric,
-                    'val_dice_T': val_metric_T,
-                }
-                # Salva wandb run id se disponibile
-                if wandb_run:
-                    checkpoint_data['wandb_run_id'] = wandb_run.id
-                    checkpoint_data['wandb_project'] = wandb_run.project
-                    checkpoint_data['wandb_entity'] = wandb_run.entity
-                
-                torch.save(checkpoint_data, model_save_path)
-                
-                print(f"  ✓ Model saved at epoch {epoch+1} with validation dice score: {val_metric:.4f}")
-                
-                if wandb_run:
-                    wandb.log({
-                        "best_dice": float(val_metric),
-                        "best_epoch": epoch + 1,
-                    }, step=epoch)
-                    
-                    # Save model to wandb
-                    wandb.save(model_save_path)
-        
-        print(f"Epoch {epoch+1}/{num_epochs} completed.")
-        
-        train_losses.append(train_loss)
-        val_losses.append(val_loss)
-        val_dice_scores.append(val_metric)
-        val_dice_scores_T.append(val_metric_T)
 
-        #print(f'  Train Loss: {np.mean(train_losses):.4f} | Val Loss: {np.mean(val_losses):.4f} | Val Dice: {np.mean(val_dice_scores):.4f} | LR: {current_lr:.2e} | Time: {epoch_time:.1f}s')
-        print(f'  Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val Dice: {val_metric:.4f} | Val Dice (with background): {val_metric_T:.4f} | LR: {current_lr:.2e} | Time: {epoch_time:.1f}s')
-        print(f'  Best Dice so far: {max_validation:.4f}')
-        print("-" * 80)
-    # salva l'ultimo checkpoint
-    if model_save_path:
-        torch.save({
+        checkpoint_data = {
             'epoch': epoch + 1,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
@@ -650,7 +603,39 @@ def train_model(model,
             'train_loss': train_loss,
             'val_loss': val_loss,
             'val_dice': val_metric,
-        }, model_save_path)
+            'val_dice_T': val_metric_T,
+        }
+        if wandb_run:
+            checkpoint_data['wandb_run_id'] = wandb_run.id
+            checkpoint_data['wandb_project'] = wandb_run.project
+            checkpoint_data['wandb_entity'] = wandb_run.entity
+
+        # Salva latest ogni epoca (usato per resume dopo kill SLURM)
+        if latest_save_path:
+            os.makedirs(os.path.dirname(latest_save_path), exist_ok=True)
+            torch.save(checkpoint_data, latest_save_path)
+
+        # Salva best solo quando migliora il dice
+        if val_metric > max_validation:
+            max_validation = val_metric
+            if model_save_path:
+                os.makedirs(os.path.dirname(model_save_path), exist_ok=True)
+                torch.save(checkpoint_data, model_save_path)
+                print(f"\n  New best! Epoch {epoch+1}, dice={val_metric:.4f} — saved to {model_save_path}")
+                if wandb_run:
+                    wandb.log({"best_dice": float(val_metric), "best_epoch": epoch + 1}, step=epoch)
+                    wandb.save(model_save_path)
+
+        print(f"Epoch {epoch+1}/{num_epochs} completed.")
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+        val_dice_scores.append(val_metric)
+        val_dice_scores_T.append(val_metric_T)
+
+        print(f'  Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val Dice: {val_metric:.4f} | Val Dice (with background): {val_metric_T:.4f} | LR: {current_lr:.2e} | Time: {epoch_time:.1f}s')
+        print(f'  Best Dice so far: {max_validation:.4f}')
+        print("-" * 80)
+
     return train_losses, val_losses, val_dice_scores
 
 import os
