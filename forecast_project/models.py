@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 from timm.models.vision_transformer import Block, PatchEmbed
+from timm.models.vision_transformer import Block, PatchEmbed
 
 
 # ---------------------------------------------------------------------------
@@ -286,3 +287,180 @@ class MAE_TemporalForecaster(nn.Module):
         x = x.reshape(x.shape[0], h, w, p, p, c)
         x = torch.einsum('nhwpqc->nchpwq', x)
         return x.reshape(x.shape[0], c, h * p, w * p)
+
+
+# ---------------------------------------------------------------------------
+# MAE_FullForecaster — riusa encoder + decoder pre-addestrati del MAE
+# ---------------------------------------------------------------------------
+
+class MAE_FullForecaster(nn.Module):
+    """
+    Forecaster che riusa il MAE completo (encoder + decoder pre-addestrati).
+    Aggiunge solo un embedding Δt (nn.Embedding) come unico nuovo parametro.
+
+    Forward:
+      1. Encode senza masking  →  [B, N+1, D]
+      2. Somma l'embedding Δt a ogni token
+      3. Decoder MAE (pre-addestrato, fine-tunato)  →  future image [B, 9, H, W]
+
+    L'architettura del decoder (8 blocchi, dec_dim=512) corrisponde al MAE
+    pre-addestrato e non è modificabile senza ricaricare pesi diversi.
+    """
+
+    def __init__(
+        self,
+        mae_checkpoint,
+        img_size=1024,
+        patch_size=16,
+        in_chans=9,
+        embed_dim=768,
+        depth=12,
+        num_heads=12,
+        decoder_embed_dim=512,
+        decoder_depth=8,       # deve corrispondere al MAE pre-addestrato
+        decoder_num_heads=16,
+        delta_t_values=None,
+        freeze_encoder=True,
+        use_gradient_checkpointing=True,
+        device='cpu',
+    ):
+        super().__init__()
+
+        self.img_size   = img_size
+        self.patch_size = patch_size
+        self.in_chans   = in_chans
+        self.embed_dim  = embed_dim
+        self.num_patches = (img_size // patch_size) ** 2
+        self.delta_t_values = delta_t_values or [12]
+        self.use_gc = use_gradient_checkpointing
+        self.freeze_encoder = freeze_encoder
+
+        norm_layer = partial(nn.LayerNorm, eps=1e-6)
+
+        # ── Encoder ───────────────────────────────────────────────────────
+        self.patch_embed   = PatchEmbed(img_size, patch_size, in_chans, embed_dim)
+        self.cls_token     = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.pos_embed     = nn.Parameter(torch.zeros(1, self.num_patches + 1, embed_dim))
+        self.blocks        = nn.ModuleList([
+            Block(embed_dim, num_heads, mlp_ratio=4., qkv_bias=True, norm_layer=norm_layer)
+            for _ in range(depth)
+        ])
+        self.norm          = norm_layer(embed_dim)
+        self.channel_embed = nn.Embedding(in_chans, embed_dim)
+
+        # ── Decoder MAE (pesi pre-addestrati) ─────────────────────────────
+        self.decoder_embed     = nn.Linear(embed_dim, decoder_embed_dim, bias=True)
+        self.decoder_pos_embed = nn.Parameter(
+            torch.zeros(1, self.num_patches + 1, decoder_embed_dim)
+        )
+        self.decoder_blocks = nn.ModuleList([
+            Block(decoder_embed_dim, decoder_num_heads, mlp_ratio=4.,
+                  qkv_bias=True, norm_layer=norm_layer)
+            for _ in range(decoder_depth)
+        ])
+        self.decoder_norm = norm_layer(decoder_embed_dim)
+        self.decoder_pred = nn.Linear(decoder_embed_dim, patch_size ** 2 * in_chans, bias=True)
+        # mask_token: presente nel checkpoint MAE, non usato in inferenza forecast
+        self.mask_token   = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
+
+        # ── Unico nuovo parametro: embedding Δt ───────────────────────────
+        self.delta_t_embed = nn.Embedding(len(self.delta_t_values), embed_dim)
+
+        self._load_pretrained(mae_checkpoint, device)
+
+        if freeze_encoder:
+            self._freeze_encoder()
+
+        nn.init.trunc_normal_(self.delta_t_embed.weight, std=0.02)
+
+    # ------------------------------------------------------------------
+    def _load_pretrained(self, ckpt_path, device):
+        state = load_mae_encoder_weights(ckpt_path, device)
+        missing, unexpected = self.load_state_dict(state, strict=False)
+        new_params = {'delta_t_embed.weight'}
+        real_missing = [k for k in missing if k not in new_params
+                        and 'channel_mask_values' not in k]
+        if real_missing:
+            print(f'[WARN] MAE_FullForecaster — missing encoder/decoder keys: {real_missing[:8]}')
+        n_loaded = len(state) - len(unexpected)
+        print(f'MAE full weights loaded: {n_loaded} tensors  '
+              f'| unexpected (skipped): {len(unexpected)}  '
+              f'| new (random init): {[k for k in missing]}')
+
+    def _freeze_encoder(self):
+        for p in (
+            list(self.patch_embed.parameters())
+            + list(self.blocks.parameters())
+            + list(self.norm.parameters())
+            + list(self.channel_embed.parameters())
+            + [self.cls_token, self.pos_embed]
+        ):
+            p.requires_grad = False
+
+    # ------------------------------------------------------------------
+    def encode(self, x):
+        B = x.shape[0]
+        x = self.patch_embed(x)                         # [B, N, D]
+        x = x + self.pos_embed[:, 1:]
+
+        all_ids  = torch.arange(self.in_chans, dtype=torch.long, device=x.device)
+        spectral = self.channel_embed(all_ids).sum(0)   # [D]
+        x = x + spectral[None, None, :]
+
+        cls = (self.cls_token + self.pos_embed[:, :1]).expand(B, -1, -1)
+        x   = torch.cat([cls, x], dim=1)                # [B, N+1, D]
+
+        for blk in self.blocks:
+            if self.use_gc and self.training:
+                x = checkpoint(blk, x, use_reentrant=False)
+            else:
+                x = blk(x)
+        return self.norm(x)                              # [B, N+1, D]
+
+    def forward(self, x, delta_t_idx):
+        if self.freeze_encoder:
+            with torch.no_grad():
+                feats = self.encode(x)
+            feats = feats.detach()
+        else:
+            feats = self.encode(x)
+
+        # Conditioning Δt: sommato a tutti i token (cls + patch)
+        dt_emb = self.delta_t_embed(delta_t_idx)        # [B, D]
+        feats  = feats + dt_emb.unsqueeze(1)
+
+        # Decode — nessun mask_token: tutti i patch sono visibili
+        dec = self.decoder_embed(feats)                  # [B, N+1, dec_D]
+        dec = dec + self.decoder_pos_embed
+        for blk in self.decoder_blocks:
+            dec = blk(dec)
+        dec = self.decoder_norm(dec)
+        dec = self.decoder_pred(dec[:, 1:])              # rimuove CLS → [B, N, p²·C]
+
+        return self.unpatchify(dec)                      # [B, 9, H, W]
+
+    # ------------------------------------------------------------------
+    def patchify(self, imgs):
+        p = self.patch_size
+        h = w = imgs.shape[2] // p
+        c = imgs.shape[1]
+        x = imgs.reshape(imgs.shape[0], c, h, p, w, p)
+        x = torch.einsum('nchpwq->nhwpqc', x)
+        return x.reshape(imgs.shape[0], h * w, p * p * c)
+
+    def unpatchify(self, x):
+        p = self.patch_size
+        h = w = int(x.shape[1] ** 0.5)
+        c = self.in_chans
+        x = x.reshape(x.shape[0], h, w, p, p, c)
+        x = torch.einsum('nhwpqc->nchpwq', x)
+        return x.reshape(x.shape[0], c, h * p, w * p)
+
+    def compute_loss(self, pred, target, norm_pix=True):
+        target_p = self.patchify(target)
+        pred_p   = self.patchify(pred)
+        if norm_pix:
+            mean     = target_p.mean(dim=-1, keepdim=True)
+            var      = target_p.var(dim=-1, keepdim=True)
+            target_p = (target_p - mean) / (var + 1e-6).sqrt()
+        return ((pred_p - target_p) ** 2).mean()

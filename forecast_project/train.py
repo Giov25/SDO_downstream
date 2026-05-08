@@ -38,7 +38,7 @@ import wandb
 
 sys.path.insert(0, os.path.dirname(__file__))
 from dataset import SDO_TemporalDataset, WAVELENGTHS_9, ZARR_PATH
-from models import MAE_TemporalForecaster
+from models import MAE_TemporalForecaster, MAE_FullForecaster
 
 # ---------------------------------------------------------------------------
 # Config
@@ -70,6 +70,10 @@ def parse_args():
     p.add_argument('--batch_size', type=int, default=2)
     p.add_argument('--num_workers', type=int, default=4)
     p.add_argument('--target_size', type=int, default=1024)
+    p.add_argument('--model_type', choices=['temporal_blocks', 'full_mae_decoder'],
+                   default='temporal_blocks',
+                   help="'temporal_blocks': nuovi temporal blocks + nuovo decoder (default). "
+                        "'full_mae_decoder': riusa encoder + decoder pre-addestrati del MAE.")
     p.add_argument('--num_temporal_blocks', type=int, default=4)
     p.add_argument('--decoder_depth', type=int, default=6)
     p.add_argument('--device', default='cuda:0')
@@ -264,14 +268,27 @@ def main():
 
     run_name = args.run_name or (
         f"{'frozen' if args.freeze_encoder else 'finetuned'}"
-        f"_tb{args.num_temporal_blocks}_dd{args.decoder_depth}"
+        + (f"_tb{args.num_temporal_blocks}_dd{args.decoder_depth}"
+           if args.model_type == 'temporal_blocks'
+           else '_full_mae_dec')
     )
 
     use_wandb = not args.no_wandb
+    wandb_id_file = (args.checkpoint_path.replace('.pth', '.wandb_id')
+                     if args.checkpoint_path else None)
     if use_wandb:
+        # Try to recover run_id from sidecar file if not passed explicitly
+        if not args.wandb_id and wandb_id_file and os.path.exists(wandb_id_file):
+            with open(wandb_id_file) as f:
+                args.wandb_id = f.read().strip()
         resume_mode = "must" if args.wandb_id else None
         wandb.init(project=args.wandb_project, name=run_name, config=vars(args),
                    id=args.wandb_id, resume=resume_mode)
+        # Save run_id for future jobs in the chain
+        if wandb_id_file and wandb.run:
+            os.makedirs(os.path.dirname(wandb_id_file), exist_ok=True)
+            with open(wandb_id_file, 'w') as f:
+                f.write(wandb.run.id)
 
     # ---- Build datasets --------------------------------------------------
     print('Building datasets...')
@@ -286,13 +303,9 @@ def main():
                               persistent_workers=args.num_workers > 0, prefetch_factor=2)
 
     # ---- Build model -----------------------------------------------------
-    print('Building model...')
-    mae_ckpt = args.mae_checkpoint
-    if args.mode == 'resume' and args.checkpoint_path:
-        # When resuming, encoder weights come from the saved forecaster checkpoint
-        mae_ckpt = args.checkpoint_path  # handled inside load_checkpoint below
+    print(f'Building model (model_type={args.model_type})...')
 
-    model = MAE_TemporalForecaster(
+    common_kwargs = dict(
         mae_checkpoint=args.mae_checkpoint,
         img_size=args.target_size,
         patch_size=16,
@@ -301,14 +314,24 @@ def main():
         depth=12,
         num_heads=12,
         decoder_embed_dim=512,
-        decoder_depth=args.decoder_depth,
         decoder_num_heads=16,
-        num_temporal_blocks=args.num_temporal_blocks,
         delta_t_values=DELTA_T_H,
         freeze_encoder=args.freeze_encoder,
         use_gradient_checkpointing=True,
         device=str(device),
-    ).to(device)
+    )
+
+    if args.model_type == 'full_mae_decoder':
+        model = MAE_FullForecaster(
+            **common_kwargs,
+            decoder_depth=8,   # deve corrispondere al MAE pre-addestrato
+        ).to(device)
+    else:
+        model = MAE_TemporalForecaster(
+            **common_kwargs,
+            decoder_depth=args.decoder_depth,
+            num_temporal_blocks=args.num_temporal_blocks,
+        ).to(device)
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total     = sum(p.numel() for p in model.parameters())

@@ -8,9 +8,12 @@
 
 cd /home/gpatane/SDO_downstream/forecast_project
 
-# --- Frozen encoder (start here) ---
+CHECKPOINT=/home/gpatane/SDO_downstream/forecast_project/checkpoints/frozen_tb6_dd8_best.pth
+[ -f "$CHECKPOINT" ] && MODE=resume || MODE=train
+
+# --- Frozen encoder tb6 dd8 ---
 conda run -n SDOenv python train.py \
-    --mode train \
+    --mode $MODE \
     --freeze_encoder \
     --mae_checkpoint /home/gpatane/SDO_downstream/mae_project/checkpoints/ch9_1024_p16/best_model.pth \
     --epochs 100 \
@@ -18,14 +21,13 @@ conda run -n SDOenv python train.py \
     --batch_size 16 \
     --num_workers 16 \
     --target_size 1024 \
-    --num_temporal_blocks 4 \
-    --decoder_depth 6 \
+    --num_temporal_blocks 6 \
+    --decoder_depth 8 \
     --device cuda:0 \
     --mixed_precision \
-    --run_name frozen_tb4_dd6 \
-    --wandb_id 7r6v9mcl \
-    --checkpoint_path /home/gpatane/SDO_downstream/forecast_project/checkpoints/frozen_tb4_dd6_best.pth \
-    
+    --run_name frozen_tb6_dd8 \
+    --checkpoint_path $CHECKPOINT \
+
 
 # --- Fine-tuning (uncomment after frozen training converges) ---
 # conda run -n SDOenv python train.py \

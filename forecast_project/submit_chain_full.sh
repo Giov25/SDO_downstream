@@ -3,8 +3,8 @@
 # (sia per completamento normale che per time limit SLURM).
 # Uso: bash submit_chain.sh [N]   (default: 10)
 
-N=${1:-10}
-SBATCH_FILE="$(dirname "$0")/train.sbatch"
+N=${1:-3}
+SBATCH_FILE="$(dirname "$0")/train_full_mae.sbatch"
 
 echo "Submitting chain of $N jobs from $SBATCH_FILE"
 
