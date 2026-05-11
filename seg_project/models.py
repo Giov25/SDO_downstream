@@ -1015,6 +1015,142 @@ class MAE_Seg_Deformer(nn.Module):
         return mask
 
 
+# ─────────────────────────── Decoder V2 ────────────────────────────────────
+
+class DoubleConv(nn.Module):
+    """Doppia convoluzione con BN+ReLU, classica di U-Net."""
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class SegDeformerUNetDecoderV2(nn.Module):
+    """
+    Decoder V2 — circa 7.5 M parametri trainabili (3× rispetto a V1).
+
+    Miglioramenti rispetto a SegDeformerUNetDecoder:
+      • FeatureAdapter su ogni scala: adatta le feature congelate al task
+        downstream senza sbloccare l'encoder.
+      • Canali doppi: 512 / 256 / 128 / 64 invece di 256 / 128 / 64 / 32.
+      • ASPP al bottleneck: cattura contesto multi-scala (sunspot di
+        dimensioni variabili).
+      • DoubleConv dopo ogni fusione skip: elaborazione locale più ricca.
+      • scSE attention dopo ogni stage: ri-calibrazione canale + spaziale.
+    """
+
+    def __init__(self, num_classes=2, embed_dim=768):
+        super().__init__()
+
+        # Adapters: residual bottleneck che adatta le feature congelate
+        self.adapter4 = FeatureAdapter(embed_dim)
+        self.adapter3 = FeatureAdapter(embed_dim)
+        self.adapter2 = FeatureAdapter(embed_dim)
+        self.adapter1 = FeatureAdapter(embed_dim)
+
+        # Proiezioni 1×1: embed_dim → canali decoder
+        self.proj4 = nn.Conv2d(embed_dim, 512, 1)
+        self.proj3 = nn.Conv2d(embed_dim, 256, 1)
+        self.proj2 = nn.Conv2d(embed_dim, 128, 1)
+        self.proj1 = nn.Conv2d(embed_dim, 64, 1)
+
+        # ASPP al bottleneck (contesto multi-scala su 512 ch)
+        self.aspp = ASPPLite(512, 512)
+
+        # Stage 3: 64×64 → 128×128
+        self.up1 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(512, 256, 3, padding=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+        )
+        self.dec3 = DoubleConv(512, 256)   # cat(up1=256, proj3=256) → 256
+        self.attn3 = SCSEBlock(256)
+
+        # Stage 2: 128×128 → 256×256
+        self.up2 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(256, 128, 3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+        )
+        self.dec2 = DoubleConv(256, 128)   # cat(up2=128, proj2=128) → 128
+        self.attn2 = SCSEBlock(128)
+
+        # Stage 1: 256×256 → 512×512
+        self.up3 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(128, 64, 3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+        )
+        self.dec1 = DoubleConv(128, 64)    # cat(up3=64, proj1=64) → 64
+        self.attn1 = SCSEBlock(64)
+
+        self.final_head = nn.Sequential(
+            nn.Dropout2d(0.1),
+            nn.Conv2d(64, 32, 3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, num_classes, 1),
+        )
+
+    def forward(self, features):
+        f1, f2, f3, f4 = features
+
+        # Bottleneck: adatta + proietta + ASPP
+        x = self.aspp(self.proj4(self.adapter4(f4)))           # [B, 512, H, W]
+        x = self.up1(x)                                        # [B, 256, 2H, 2W]
+
+        # Stage 3
+        s3 = F.interpolate(
+            self.proj3(self.adapter3(f3)), size=x.shape[2:],
+            mode='bilinear', align_corners=False
+        )
+        x = self.attn3(self.dec3(torch.cat([x, s3], dim=1)))  # [B, 256, 2H, 2W]
+        x = self.up2(x)                                        # [B, 128, 4H, 4W]
+
+        # Stage 2
+        s2 = F.interpolate(
+            self.proj2(self.adapter2(f2)), size=x.shape[2:],
+            mode='bilinear', align_corners=False
+        )
+        x = self.attn2(self.dec2(torch.cat([x, s2], dim=1)))  # [B, 128, 4H, 4W]
+        x = self.up3(x)                                        # [B, 64, 8H, 8W]
+
+        # Stage 1
+        s1 = F.interpolate(
+            self.proj1(self.adapter1(f1)), size=x.shape[2:],
+            mode='bilinear', align_corners=False
+        )
+        x = self.attn1(self.dec1(torch.cat([x, s1], dim=1)))  # [B, 64, 8H, 8W]
+
+        return self.final_head(x)
+
+
+class MAE_Seg_DeformerV2(nn.Module):
+    def __init__(self, mae_model, num_classes=2):
+        super().__init__()
+        self.encoder = MAEFeatureExtractor(mae_model)
+        self.decoder = SegDeformerUNetDecoderV2(num_classes=num_classes, embed_dim=768)
+
+    def forward(self, x):
+        features = self.encoder(x)
+        mask = self.decoder(features)
+        if mask.shape[-2:] != x.shape[-2:]:
+            mask = F.interpolate(mask, size=x.shape[-2:], mode='bilinear', align_corners=False)
+        return mask
+
+
 class MAE_FrozenEncoderSeg(nn.Module):
     """
     Modello MAE di ricostruzione adattato per la segmentazione downstream.

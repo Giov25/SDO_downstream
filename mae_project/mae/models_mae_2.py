@@ -447,6 +447,7 @@ def mae_model_channel_masking_9ch_with_temporal_attn(**kwargs):
     patch_size = kwargs.get('patch_size', 16)
     in_chans = kwargs.get('in_chans', 9)
     mask_ratio = kwargs.get('mask_ratio', 0.75)
+    norm_pix_loss = kwargs.get('norm_pix_loss', False)
 
     model = MaskedAutoencoderViT(
         img_size=img_size,
@@ -461,7 +462,7 @@ def mae_model_channel_masking_9ch_with_temporal_attn(**kwargs):
         in_chans=in_chans,
         mlp_ratio=4,
         norm_layer=partial(nn.LayerNorm, eps=1e-6),
-        norm_pix_loss=False,
+        norm_pix_loss=norm_pix_loss,
         grid_size=2,
         mask_mode='channel',
         use_channel_attention=True,

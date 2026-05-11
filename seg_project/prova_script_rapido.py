@@ -16,7 +16,7 @@ from monai.transforms import AsDiscrete, Compose
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 from unet_pytorch.model import UNet
-from models import MAE_UNet_Segmentation, MAE_Seg_Advanced, MAE_Seg_Deformer, MAE_FrozenEncoderSeg
+from models import MAE_UNet_Segmentation, MAE_Seg_Advanced, MAE_Seg_Deformer, MAE_Seg_DeformerV2, MAE_FrozenEncoderSeg
 from mae.models_mae_2 import mae_model_channel_masking_9ch_with_temporal_attn
 from dataset import SDO_9Channel_Dataset
 from utils_2 import train_model, load_checkpoint_with_channel_adaptation, freeze_encoder
@@ -158,6 +158,26 @@ def setup_model(args, device):
             model = MAE_Seg_Deformer(mae_backbone, num_classes=2).to(device)
             for param in model.encoder.parameters():
                 param.requires_grad = True
+
+    elif model_name == 'MAE_Seg_DeformerV2':
+        mae_backbone = mae_model_channel_masking_9ch_with_temporal_attn().to(device)
+
+        if args.load_pretrained:
+            checkpoint = torch.load(args.mae_checkpoint, map_location=device)
+            state_dict = checkpoint.get("model_state_dict", checkpoint)
+            mae_backbone.load_state_dict(state_dict, strict=False)
+            print("✅ Loaded MAE pretrained weights from:", args.mae_checkpoint)
+
+        model = MAE_Seg_DeformerV2(mae_backbone, num_classes=2).to(device)
+
+        if args.freeze_encoder:
+            for param in model.encoder.parameters():
+                param.requires_grad = False
+            print("❄️  Encoder FROZEN — feature extraction mode")
+        else:
+            for param in model.encoder.parameters():
+                param.requires_grad = True
+            print("🔥 Encoder TRAINABLE — fine-tuning mode")
 
     elif model_name == 'MAE_FrozenEncoder':
         # Crea il backbone MAE con 2 canali di output (segmentazione)

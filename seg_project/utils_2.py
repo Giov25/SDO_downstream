@@ -224,7 +224,10 @@ def load_checkpoint_with_channel_adaptation(model, checkpoint_path, in_chans=9, 
     """
     checkpoint = torch.load(checkpoint_path, map_location=device)
     state_dict = checkpoint["model_state_dict"]
-    
+
+    # rimuovi prefisso _orig_mod. aggiunto da torch.compile()
+    state_dict = {(k[10:] if k.startswith("_orig_mod.") else k): v for k, v in state_dict.items()}
+
     # Determina i canali dal checkpoint in base alla forma di decoder_pred.weight
     original_weight = state_dict['decoder_pred.weight']
     original_bias = state_dict['decoder_pred.bias']

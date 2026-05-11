@@ -45,6 +45,8 @@ def get_args():
     parser.add_argument("--patch_size", type=int, default=16)
     parser.add_argument("--embed_dim", type=int, default=768)
     parser.add_argument("--decoder_embed_dim", type=int, default=512)
+    parser.add_argument("--norm_pix_loss", action="store_true", default=False,
+                        help="Per-patch normalized MSE loss (recommended by MAE paper)")
 
     # Hardware
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -164,6 +166,7 @@ def train():
         patch_size=args.patch_size,
         in_chans=len(wavelengths),
         mask_ratio=args.mask_ratio,
+        norm_pix_loss=args.norm_pix_loss,
     ).to(args.device)
     import subprocess
     result = subprocess.run(['nvidia-smi', '--query-gpu=index,uuid', '--format=csv,noheader'], capture_output=True, text=True)

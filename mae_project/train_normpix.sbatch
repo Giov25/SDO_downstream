@@ -1,0 +1,29 @@
+#!/bin/bash
+#SBATCH --job-name=MAE_normpix
+#SBATCH --partition=gpu
+#SBATCH --qos=train
+#SBATCH --gres=gpu:1
+#SBATCH --output=%x-%j.out
+#SBATCH --error=%x-%j.err
+
+CHECKPOINT=/home/gpatane/SDO_downstream/mae_project/checkpoints/ch9_1024_p16_normpix/best_model.pth
+[ -f "$CHECKPOINT" ] && RESUME_OPT="--resume_from $CHECKPOINT" || RESUME_OPT=""
+
+conda run -n SDOenv python /home/gpatane/SDO_downstream/mae_project/train.py \
+    --zarr_path /home/gpatane/Dataset/zarr_file_magnetogram_1024_ORDINATO.zarr \
+    --checkpoint_dir /home/gpatane/SDO_downstream/mae_project/checkpoints/ch9_1024_p16_normpix/ \
+    --image_size 1024 \
+    --patch_size 16 \
+    --mask_ratio 0.25 \
+    --batch_size 16 \
+    --accum_steps 8 \
+    --epochs 100 \
+    --lr 1.5e-4 \
+    --warmup_epochs 10 \
+    --weight_decay 0.05 \
+    --grad_clip 1.0 \
+    --mixed_precision \
+    --compile \
+    --norm_pix_loss \
+    --wandb_enabled \
+    $RESUME_OPT
