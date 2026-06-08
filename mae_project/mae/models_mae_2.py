@@ -433,14 +433,7 @@ class MaskedAutoencoderViT(nn.Module):
         loss = self.forward_loss(imgs, pred, channel_indices, spatial_mask)
         return loss, pred, spatial_mask
 
-def mae_model_for_pretraining(**kwargs):            #random masking
-    """ MAE model for pretraining with random masking
-    """
-    model = MaskedAutoencoderViT(
-        img_size=672, patch_size=14, embed_dim=768, depth=12, num_heads=12, n_img_mask=None, # Ensure img_size is correct if not default
-        decoder_embed_dim=512, decoder_depth=8, decoder_num_heads=16, in_chans=3,
-        mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), grid_size=3, mask_mode='spatial') 
-    return model
+
 
 def mae_model_channel_masking_9ch_with_temporal_attn(**kwargs):
     img_size = kwargs.get('img_size', 1024)

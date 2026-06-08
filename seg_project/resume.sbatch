@@ -3,9 +3,8 @@
 #SBATCH --partition=gpu
 #SBATCH --qos=train
 #SBATCH --gres=gpu:1
-#SBATCH --time=23:59:00
-#SBATCH --output=%x-%j.out
-#SBATCH --error=%x-%j.err
+#SBATCH --output=logs/%x-%j.out
+#SBATCH --error=logs/%x-%j.err
 
 # Script per RIPRENDERE il training dopo un'interruzione
 # Questo continuerà la stessa run su WandB

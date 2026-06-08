@@ -16,7 +16,7 @@ from monai.transforms import AsDiscrete, Compose
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 from unet_pytorch.model import UNet
-from models import MAE_UNet_Segmentation, MAE_Seg_Advanced, MAE_Seg_Deformer, MAE_Seg_DeformerV2, MAE_FrozenEncoderSeg
+from models import MAE_UNet_Segmentation, MAE_Seg_Advanced, MAE_Seg_Deformer, MAE_Seg_DeformerV2, MAE_Seg_DeformerV3, MAE_FrozenEncoderSeg
 from mae.models_mae_2 import mae_model_channel_masking_9ch_with_temporal_attn
 from dataset import SDO_9Channel_Dataset
 from utils_2 import train_model, load_checkpoint_with_channel_adaptation, freeze_encoder
@@ -59,6 +59,8 @@ def get_args():
     parser.add_argument('--loss', type=str, choices=['DiceCELoss', 'TwerskyLoss'],
                         default='TwerskyLoss', help="Loss function to use.")
     parser.add_argument('--device', type=str, default="cuda:0")
+    parser.add_argument('--patch_size', type=int, default=16,
+                        help="Patch size for the MAE backbone (must match the pretrained checkpoint).")
 
     return parser.parse_args()
 
@@ -93,20 +95,22 @@ def setup_model(args, device):
 
     model_name = args.model
 
+    patch_size = getattr(args, 'patch_size', 16)
+
     if model_name == 'MAE_UNet_Segmentation':
-        mae_backbone = mae_model_channel_masking_9ch_with_temporal_attn().to(device)
+        mae_backbone = mae_model_channel_masking_9ch_with_temporal_attn(patch_size=patch_size).to(device)
         model = MAE_UNet_Segmentation(mae_backbone, num_classes=2).to(device)
         for param in model.encoder.parameters():
             param.requires_grad = False
 
     elif model_name == 'MAE_Seg_Advanced':
-        mae_backbone = mae_model_channel_masking_9ch_with_temporal_attn().to(device)
+        mae_backbone = mae_model_channel_masking_9ch_with_temporal_attn(patch_size=patch_size).to(device)
         model = MAE_Seg_Advanced(mae_backbone, num_classes=2).to(device)
         for param in model.encoder.parameters():
             param.requires_grad = False
 
     elif model_name == 'MAE_2Channel':
-        model = mae_model_channel_masking_9ch_with_temporal_attn(out_chans=2)
+        model = mae_model_channel_masking_9ch_with_temporal_attn(out_chans=2, patch_size=patch_size)
 
         # STEP 1: carica SEMPRE i pesi MAE pretrained (encoder backbone)
         if os.path.exists(args.mae_checkpoint):
@@ -136,7 +140,7 @@ def setup_model(args, device):
         model = model.to(device)
         
     elif model_name == 'MAE_Seg_Deformer':
-        mae_backbone = mae_model_channel_masking_9ch_with_temporal_attn().to(device)
+        mae_backbone = mae_model_channel_masking_9ch_with_temporal_attn(patch_size=patch_size).to(device)
 
         if args.load_pretrained:
             checkpoint = torch.load(args.mae_checkpoint, map_location=device)
@@ -159,8 +163,8 @@ def setup_model(args, device):
             for param in model.encoder.parameters():
                 param.requires_grad = True
 
-    elif model_name == 'MAE_Seg_DeformerV2':
-        mae_backbone = mae_model_channel_masking_9ch_with_temporal_attn().to(device)
+    elif model_name in ('MAE_Seg_DeformerV2', 'MAE_Seg_DeformerV3'):
+        mae_backbone = mae_model_channel_masking_9ch_with_temporal_attn(patch_size=patch_size).to(device)
 
         if args.load_pretrained:
             checkpoint = torch.load(args.mae_checkpoint, map_location=device)
@@ -168,7 +172,8 @@ def setup_model(args, device):
             mae_backbone.load_state_dict(state_dict, strict=False)
             print("✅ Loaded MAE pretrained weights from:", args.mae_checkpoint)
 
-        model = MAE_Seg_DeformerV2(mae_backbone, num_classes=2).to(device)
+        cls = MAE_Seg_DeformerV3 if model_name == 'MAE_Seg_DeformerV3' else MAE_Seg_DeformerV2
+        model = cls(mae_backbone, num_classes=2).to(device)
 
         if args.freeze_encoder:
             for param in model.encoder.parameters():
@@ -181,7 +186,7 @@ def setup_model(args, device):
 
     elif model_name == 'MAE_FrozenEncoder':
         # Crea il backbone MAE con 2 canali di output (segmentazione)
-        mae_backbone = mae_model_channel_masking_9ch_with_temporal_attn(out_chans=2)
+        mae_backbone = mae_model_channel_masking_9ch_with_temporal_attn(out_chans=2, patch_size=patch_size)
 
         # Carica i pesi pretrained dalla ricostruzione e adatta l'head finale
         if os.path.exists(args.mae_checkpoint):
@@ -230,8 +235,8 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
     wavelengths = ['1700A', '1600A', '335A', '304A', '211A', '193A', '171A', '131A', 'Magnetogram']
-    train_years = list(range(2011, 2021))
-    val_years   = list(range(2021, 2023))
+    train_years = list(range(2011, 2021))   # 10 anni invece di 1
+    val_years   = list(range(2021, 2022))
     test_years  = list(range(2023, 2026))
 
     # ------------------------------------------------------------------
@@ -288,9 +293,9 @@ def main():
 
         # ---- Datasets ----
         train_ds = SDO_9Channel_Dataset(wcfg.zarr_path, train_years, wavelengths,
-                                        target_size=wcfg.image_size)
+                                        target_size=wcfg.image_size, augment=True)
         val_ds   = SDO_9Channel_Dataset(wcfg.zarr_path, val_years,   wavelengths,
-                                        target_size=wcfg.image_size)
+                                        target_size=wcfg.image_size, augment=False)
         train_loader = DataLoader(train_ds, batch_size=wcfg.batch_size, shuffle=True,
                                   num_workers=4, pin_memory=True)
         val_loader   = DataLoader(val_ds,   batch_size=wcfg.batch_size, shuffle=False,
@@ -305,20 +310,21 @@ def main():
             freeze_encoder=args.freeze_encoder,
             mae_checkpoint=args.mae_checkpoint,
             checkpoint_path=args.checkpoint_path,
+            patch_size=args.patch_size,
         )
         model = setup_model(model_args, device)
 
         # ---- Optimizer ----
-        optimizer = torch.optim.AdamW(model.parameters(), lr=wcfg.lr, weight_decay=1e-2)
+        #optimizer = torch.optim.AdamW(model.parameters(), lr=wcfg.lr, weight_decay=1e-2)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=wcfg.lr, weight_decay=1e-4)
 
         # ---- Loss ----
         if wcfg.loss == 'DiceCELoss':
             criterion = DiceCELoss(to_onehot_y=True, softmax=True,
                                    lambda_dice=1.5, lambda_ce=1.0, include_background=False)
-        else:  # TwerskyLoss
+        else:  # TwerskyLoss — alpha=0.3 beta=0.7: penalizza i falsi negativi (recall-focused per sunspot piccoli)
             criterion = monai.losses.TverskyLoss(to_onehot_y=True, softmax=True,
-                                                 alpha=0.5, beta=0.5, include_background=False)
-
+                                                 alpha=0.3, beta=0.7, include_background=False)
         dice_metric   = DiceMetric(include_background=False, reduction="mean")
         dice_metric_T = DiceMetric(include_background=True,  reduction="mean")
 

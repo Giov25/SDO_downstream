@@ -2,7 +2,7 @@
 # Catena di job per forecast con encoder MAE normpix.
 # Uso: bash submit_chain_normpix.sh [N]   (default: 10)
 
-N=${1:-10}
+N=${1:-3}
 SBATCH_FILE="$(dirname "$0")/train_normpix.sbatch"
 
 echo "Submitting chain of $N jobs from $SBATCH_FILE"

@@ -1,10 +1,10 @@
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 from monai.transforms import (Compose,AsDiscrete)
 from monai.data import decollate_batch
 from time import time
 import numpy as np
-import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
 import wandb
@@ -271,14 +271,21 @@ def load_checkpoint_with_channel_adaptation(model, checkpoint_path, in_chans=9, 
 
 
 def _forward_to_image(model, data):
-    """Chiama model(data) e restituisce sempre un tensore [B, C, H, W].
+    """Chiama model(data) e restituisce un tensore [B,C,H,W] o una tuple
+    (main, *aux) per modelli con deep supervision (V3).
     Usa forward_seg se disponibile (nessun channel masking, deterministic)."""
     if hasattr(model, 'forward_seg'):
         return model.forward_seg(data)
     out = model(data)
     if isinstance(out, tuple):
-        _, pred, _ = out
-        return model.unpatchify(pred)
+        # MAE format: (loss_scalar_or_None, pred_patches, mask) — il primo elemento
+        # è None o uno scalare. Deep supervision: (main_logit, aux1, aux2) — tutti 4D.
+        first = out[0]
+        is_mae_tuple = (first is None) or (isinstance(first, torch.Tensor) and first.dim() < 4)
+        if is_mae_tuple:
+            _, pred, _ = out
+            return model.unpatchify(pred)
+        return out   # deep supervision tuple: (main, aux3, aux2)
     return out
 
 
@@ -291,11 +298,22 @@ def train_one_epoch_mod(model, loader, criterion, optimizer, device, scheduler, 
         data = batch['image'].to(device)
         labels = batch['mask'].to(device)
         optimizer.zero_grad()
-        recon = _forward_to_image(model, data)
-        loss = criterion(recon, labels)
+        out = _forward_to_image(model, data)
+
+        if isinstance(out, tuple):
+            # Deep supervision: (main, aux3, aux2)
+            main, *auxs = out
+            target_size = labels.shape[2:]
+            loss = criterion(main, labels)
+            aux_weights = [0.4, 0.2]
+            for aux, w in zip(auxs, aux_weights[:len(auxs)]):
+                aux_up = F.interpolate(aux, size=target_size, mode='bilinear', align_corners=False)
+                loss = loss + w * criterion(aux_up, labels)
+        else:
+            loss = criterion(out, labels)
+
         loss.backward()
 
-        # Gradient clipping per stabilità
         if max_grad_norm is not None:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
 
@@ -582,6 +600,10 @@ def train_model(model,
 
         current_lr = optimizer.param_groups[0]['lr']
 
+        is_best = val_metric > max_validation
+        if is_best:
+            max_validation = val_metric
+
         if wandb_run:
             log_dict = {
                 "epoch": epoch + 1,
@@ -590,7 +612,8 @@ def train_model(model,
                 "val/dice_score": float(val_metric),
                 "val/dice_score_T": float(val_metric_T),
                 "learning_rate": float(current_lr),
-                "epoch_time": float(epoch_time)
+                "epoch_time": float(epoch_time),
+                "best_dice": float(max_validation),
             }
             wandb.log(log_dict)
 
@@ -619,14 +642,12 @@ def train_model(model,
             torch.save(checkpoint_data, latest_save_path)
 
         # Salva best solo quando migliora il dice
-        if val_metric > max_validation:
-            max_validation = val_metric
+        if is_best:
             if model_save_path:
                 os.makedirs(os.path.dirname(model_save_path), exist_ok=True)
                 torch.save(checkpoint_data, model_save_path)
                 print(f"\n  New best! Epoch {epoch+1}, dice={val_metric:.4f} — saved to {model_save_path}")
                 if wandb_run:
-                    wandb.log({"best_dice": float(val_metric), "best_epoch": epoch + 1}, step=epoch)
                     wandb.save(model_save_path)
 
         print(f"Epoch {epoch+1}/{num_epochs} completed.")

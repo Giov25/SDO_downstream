@@ -4,8 +4,8 @@
 #SBATCH --qos=train
 #SBATCH --gres=gpu:1
 #SBATCH --time=23:59:00
-#SBATCH --output=%x-%j.out
-#SBATCH --error=%x-%j.err
+#SBATCH --output=logs/%x-%j.out
+#SBATCH --error=logs/%x-%j.err
 
 # 🔥 RESUME: FINE-TUNING
 # Riprende il training dell'esperimento di fine-tuning

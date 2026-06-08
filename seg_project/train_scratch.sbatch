@@ -3,8 +3,8 @@
 #SBATCH --partition=gpu
 #SBATCH --qos=train
 #SBATCH --gres=gpu:1
-#SBATCH --output=%x-%j.out
-#SBATCH --error=%x-%j.err
+#SBATCH --output=logs/%x-%j.out
+#SBATCH --error=logs/%x-%j.err
 
 # 🆕 ESPERIMENTO 3: FROM SCRATCH
 # NON carica pesi pretrained, allena tutto da zero

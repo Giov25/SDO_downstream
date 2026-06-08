@@ -3,8 +3,8 @@
 #SBATCH --partition=gpu
 #SBATCH --qos=train
 #SBATCH --gres=gpu:1
-#SBATCH --output=%x-%j.out
-#SBATCH --error=%x-%j.err
+#SBATCH --output=logs/%x-%j.out
+#SBATCH --error=logs/%x-%j.err
 
 BEST_CKPT=/home/gpatane/checkpoints/Scratch_MAE_2Channel.pth
 LATEST_CKPT=/home/gpatane/checkpoints/Scratch_MAE_2Channel_latest.pth

@@ -5,7 +5,7 @@ import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 from timm.models.vision_transformer import Block, PatchEmbed
 from timm.models.vision_transformer import Block, PatchEmbed
-
+import torch.nn.functional as F
 
 # ---------------------------------------------------------------------------
 # Checkpoint loading helper
@@ -245,26 +245,35 @@ class MAE_TemporalForecaster(nn.Module):
         dec = dec + self.decoder_pos_embed
         for blk in self.decoder_blocks:
             dec = blk(dec)
-        dec = self.decoder_norm(dec)
         dec = self.decoder_pred(dec)                      # [B, N+1, p²·C]
-        dec = dec[:, 1:, :]                               # remove CLS → [B, N, p²·C]
+        dec = dec[:, 1:, :]
 
-        # 5. Unpatchify
-        return self.unpatchify(dec)                       # [B, 9, H, W]
+        # 5. Unpatchify + constrain to [0, 1] (matches dataset normalization)
+        return torch.sigmoid(self.unpatchify(dec))        # [B, 9, H, W]
 
     # ------------------------------------------------------------------
     # Loss
     # ------------------------------------------------------------------
+    def total_variation_loss(img):
+        # img ha shape [B, C, H, W]
+        tv_h = torch.abs(img[:, :, 1:, :] - img[:, :, :-1, :]).mean()
+        tv_w = torch.abs(img[:, :, :, 1:] - img[:, :, :, :-1]).mean()
+        return tv_h + tv_w
+    def compute_loss(self, pred, target, norm_pix=False, tv_weight=0):
+            """Per-patch normalised MSE (same convention as MAE pre-training)."""
+            target_p = self.patchify(target)  # [B, N, p²·C]
+            pred_p = self.patchify(pred)
+            if norm_pix:
+                mean = target_p.mean(dim=-1, keepdim=True)
+                var = target_p.var(dim=-1, keepdim=True)
+                target_p = (target_p - mean) / (var + 1e-6).sqrt()
+            mse = ((pred_p - target_p) ** 2).mean()
+            tv_h = torch.abs(pred[:, :, 1:, :] - pred[:, :, :-1, :]).mean()
+            tv_w = torch.abs(pred[:, :, :, 1:] - pred[:, :, :, :-1]).mean()
+            tv_loss = tv_h + tv_w
+            return mse + tv_weight * tv_loss
+            #return ((pred_p - target_p) ** 2).mean()
 
-    def compute_loss(self, pred, target, norm_pix=True):
-        """Per-patch normalised MSE (same convention as MAE pre-training)."""
-        target_p = self.patchify(target)  # [B, N, p²·C]
-        pred_p = self.patchify(pred)
-        if norm_pix:
-            mean = target_p.mean(dim=-1, keepdim=True)
-            var = target_p.var(dim=-1, keepdim=True)
-            target_p = (target_p - mean) / (var + 1e-6).sqrt()
-        return ((pred_p - target_p) ** 2).mean()
 
     # ------------------------------------------------------------------
     # Patch utilities
@@ -456,7 +465,7 @@ class MAE_FullForecaster(nn.Module):
         x = torch.einsum('nhwpqc->nchpwq', x)
         return x.reshape(x.shape[0], c, h * p, w * p)
 
-    def compute_loss(self, pred, target, norm_pix=True):
+    def compute_loss(self, pred, target, norm_pix=False):
         target_p = self.patchify(target)
         pred_p   = self.patchify(pred)
         if norm_pix:

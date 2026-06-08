@@ -3,8 +3,8 @@
 #SBATCH --partition=gpu
 #SBATCH --qos=train
 #SBATCH --gres=gpu:1
-#SBATCH --output=%x-%j.out
-#SBATCH --error=%x-%j.err
+#SBATCH --output=logs/%x-%j.out
+#SBATCH --error=logs/%x-%j.err
 
 # Test/forecast fine-tuning end-to-end con pesi MAE normpix
 # Richiede che train_finetuning_normpix.sbatch sia gia' stato eseguito

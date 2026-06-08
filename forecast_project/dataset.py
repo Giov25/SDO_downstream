@@ -1,4 +1,5 @@
 import bisect
+import json
 import random
 from datetime import datetime, timezone
 
@@ -14,6 +15,10 @@ WAVELENGTHS_9 = ['94A', '131A', '171A', '193A', '211A', '304A', '335A', '1600A',
 _RECHUNKED = '/home/gpatane/Dataset/zarr_file_magnetogram_1024_rechunked.zarr'
 _ORIGINAL  = '/home/gpatane/Dataset/zarr_file_magnetogram_1024_definitivo.zarr'
 ZARR_PATH  = _RECHUNKED if __import__('os').path.exists(_RECHUNKED) else _ORIGINAL
+
+_STATS_PATH = '/home/gpatane/Dataset/statistiche_globali.json'
+with open(_STATS_PATH) as _f:
+    _CHANNEL_STATS = json.load(_f)
 
 
 class SDO_TemporalDataset(Dataset):
@@ -105,7 +110,12 @@ class SDO_TemporalDataset(Dataset):
             img = self.z[year][wl][local_idx].astype(np.float32)
             img = np.nan_to_num(img, nan=0.0, posinf=0.0, neginf=0.0)
 
-            img = np.sign(img * 0.01) * np.log1p(np.abs(img * 0.01))
+            # Same normalization as MAE pre-training (statistiche_globali.json)
+            stats = _CHANNEL_STATS[wl]
+            img = np.clip(img, 0, None)
+            img = np.log1p(img * 0.01)
+            p_max = stats['p_max_log']
+            img = np.clip(img, 0.0, p_max) / p_max  # → [0, 1]
 
             if img.shape[0] != self.target_size:
                 scale = self.target_size / img.shape[0]

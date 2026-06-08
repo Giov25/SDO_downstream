@@ -4,6 +4,7 @@ import torch
 from torch.utils.data import Dataset
 import numpy as np
 import os
+import json
 from astropy.io import fits
 import zarr
 import dask.array as da
@@ -18,9 +19,13 @@ import dask.array as da
 import random
 from sklearn.model_selection import train_test_split
 
+_STATS_PATH = '/home/gpatane/Dataset/statistiche_globali.json'
+with open(_STATS_PATH) as _f:
+    _CHANNEL_STATS = json.load(_f)
+
 
 class SDO_9Channel_Dataset(Dataset):
-    def __init__(self, zarr_path, list_year, wavelengths, target_size=512, transform=None, num_classes=1):
+    def __init__(self, zarr_path, list_year, wavelengths, target_size=512, transform=None, num_classes=1, augment=False):
         """
         Args:
             zarr_path (str): Path al file Zarr.
@@ -36,7 +41,8 @@ class SDO_9Channel_Dataset(Dataset):
         self.target_size = target_size
         self.transform = transform
         self.num_classes = num_classes
-        
+        self.augment = augment
+
         # Pre-calcolo degli indici per accesso immediato O(1)
         self.indices = []
         for year in self.list_year:
@@ -57,21 +63,24 @@ class SDO_9Channel_Dataset(Dataset):
         year, local_idx = self.indices[idx]
         
         # 1. Caricamento e Normalizzazione dei 9 canali AIA
+        # Stessa normalizzazione del MAE pre-training (SDO_Dataset_channels_FAST)
         aia_imgs = []
-        for i, wl in enumerate(self.wavelengths):
+        for wl in self.wavelengths:
             img = self.z[year][wl][local_idx].astype(np.float32)
-            img_scaled = 0.01 * img
-            img_transformed = np.sign(img_scaled) * np.log1p(np.abs(img_scaled))
-            if hasattr(self, 'means') and self.means is not None:
-                img_transformed = (img_transformed - self.means[i]) / (self.stds[i] + 1e-8)        
-            aia_imgs.append(img_transformed)
-            # Normalizzazione Robust Percentile (2.5% - 99.5%)
-            # p_low, p_high = np.percentile(img, [2.5, 99.5])
-            # img = np.clip(img, p_low, p_high)
-            # img = (img - p_low) / (p_high - p_low + 1e-6)
-            
-            # aia_imgs.append(img)
-            
+            img = np.nan_to_num(img, nan=0.0, posinf=0.0, neginf=0.0)
+
+            if wl == 'Magnetogram':
+                limite = _CHANNEL_STATS[wl]['clip_max']
+                img = np.clip(img, -limite, limite)
+                img = np.sign(img * 0.01) * np.log1p(np.abs(img * 0.01))
+            else:
+                img = np.clip(img, 0, None)
+                img = np.log1p(img * 0.01)
+                p_max = _CHANNEL_STATS[wl]['p_max_log']
+                img = np.clip(img, 0.0, p_max) / p_max  # → [0, 1]
+
+            aia_imgs.append(img)
+
         # Stack dei 9 canali: [9, H, W]
         aia_stack = np.stack(aia_imgs, axis=0)
         
@@ -93,6 +102,22 @@ class SDO_9Channel_Dataset(Dataset):
             mask = zoom(mask.astype(np.float32), (scale, scale), order=0)
             # Resize IC originale
             ic_img = zoom(ic_img, (scale, scale), order=1)
+
+        # 3b. Augmentation geometrica (solo training): flip orizzontale/verticale + rot 90°
+        if self.augment:
+            if random.random() > 0.5:
+                aia_stack = aia_stack[:, :, ::-1].copy()  # flip orizzontale
+                mask = mask[:, ::-1].copy()
+                ic_img = ic_img[:, ::-1].copy()
+            if random.random() > 0.5:
+                aia_stack = aia_stack[:, ::-1, :].copy()  # flip verticale
+                mask = mask[::-1, :].copy()
+                ic_img = ic_img[::-1, :].copy()
+            k = random.randint(0, 3)
+            if k > 0:
+                aia_stack = np.rot90(aia_stack, k, axes=(1, 2)).copy()
+                mask = np.rot90(mask, k).copy()
+                ic_img = np.rot90(ic_img, k).copy()
 
         # 4. Conversione in Tensori
         image_tensor = torch.from_numpy(aia_stack).float()

@@ -48,7 +48,8 @@ TRAIN_YEARS  = list(range(2011, 2021))
 VAL_YEAR     = list(range(2021, 2023))
 TEST_YEARS   = list(range(2023, 2026))
 #DELTA_T_H    = [12, 24, 36, 48, 168]
-DELTA_T_H    = [12]
+#DELTA_T_H    = [24, 36, 48]
+DELTA_T_H    = [24]
 CKPT_DIR     = os.path.join(os.path.dirname(__file__), 'checkpoints')
 DEFAULT_MAE  = '/home/gpatane/SDO_downstream/mae_project/checkpoints/ch9_1024_p16/best_model.pth'
 
@@ -90,6 +91,9 @@ def parse_args():
                    help='Run validation every N training steps (within an epoch)')
     p.add_argument('--log_every_steps', type=int, default=50,
                    help='Print progress and log to WandB every N steps')
+    p.add_argument('--max_epochs_per_job', type=int, default=None,
+                   help='Stop after this many epochs in this job (for SLURM chains). '
+                        'None = run until --epochs.')
     return p.parse_args()
 
 # ---------------------------------------------------------------------------
@@ -200,6 +204,7 @@ def train_one_epoch(model, loader, optimiser, device, epoch, args,
                 save_checkpoint(
                     os.path.join(CKPT_DIR, f'{run_name}_best.pth'),
                     model, optimiser, None, epoch, best_val_loss, args,
+                    global_step=global_step,
                 )
                 print(f'  *** New best val loss: {best_val_loss:.4f} ***', flush=True)
 
@@ -236,16 +241,20 @@ def validate(model, loader, device, delta_t_values):
 # Checkpoint helpers
 # ---------------------------------------------------------------------------
 
-def save_checkpoint(path, model, optimiser, scheduler, epoch, best_loss, args):
+def save_checkpoint(path, model, optimiser, scheduler, epoch, best_loss, args, global_step=None):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    torch.save({
+    ckpt = {
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimiser.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict(),
         'best_val_loss': best_loss,
         'args': vars(args),
-    }, path)
+    }
+    if scheduler is not None:
+        ckpt['scheduler_state_dict'] = scheduler.state_dict()
+    if global_step is not None:
+        ckpt['global_step'] = global_step
+    torch.save(ckpt, path)
 
 
 def load_checkpoint(path, model, optimiser=None, scheduler=None, device='cpu'):
@@ -255,7 +264,7 @@ def load_checkpoint(path, model, optimiser=None, scheduler=None, device='cpu'):
         optimiser.load_state_dict(ckpt['optimizer_state_dict'])
     if scheduler and 'scheduler_state_dict' in ckpt:
         scheduler.load_state_dict(ckpt['scheduler_state_dict'])
-    return ckpt.get('epoch', 0), ckpt.get('best_val_loss', float('inf'))
+    return ckpt.get('epoch', 0), ckpt.get('best_val_loss', float('inf')), ckpt.get('global_step', None)
 
 # ---------------------------------------------------------------------------
 # Main
@@ -308,7 +317,7 @@ def main():
     common_kwargs = dict(
         mae_checkpoint=args.mae_checkpoint,
         img_size=args.target_size,
-        patch_size=16,
+        patch_size=8,
         in_chans=9,
         embed_dim=768,
         depth=12,
@@ -356,17 +365,20 @@ def main():
     # ---- Resume ----------------------------------------------------------
     if args.mode == 'resume' and args.checkpoint_path:
         print(f'Resuming from {args.checkpoint_path}', flush=True)
-        start_epoch, best_val_loss = load_checkpoint(
+        start_epoch, best_val_loss, ckpt_global_step = load_checkpoint(
             args.checkpoint_path, model, optimiser, scheduler, str(device)
         )
-        global_step = start_epoch * len(train_loader)
+        if ckpt_global_step is not None:
+            global_step = ckpt_global_step
+        else:
+            global_step = start_epoch * len(train_loader)
         start_epoch += 1
 
     # ---- Test only -------------------------------------------------------
     if args.mode == 'test':
         ckpt_path = args.checkpoint_path
         assert ckpt_path, '--checkpoint_path required for test mode'
-        load_checkpoint(ckpt_path, model, device=str(device))
+        load_checkpoint(ckpt_path, model, device=str(device))  # returns (epoch, best_loss, step) — unused here
         test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
                                  num_workers=args.num_workers)
         overall, per_dt = validate(model, test_loader, device, DELTA_T_H)
@@ -382,7 +394,11 @@ def main():
           f'Val every {args.val_every_steps} steps  |  '
           f'Log every {args.log_every_steps} steps', flush=True)
 
-    for epoch in range(start_epoch, args.epochs):
+    epoch_end = args.epochs
+    if args.max_epochs_per_job is not None:
+        epoch_end = min(args.epochs, start_epoch + args.max_epochs_per_job)
+
+    for epoch in range(start_epoch, epoch_end):
         print(f'\n=== Epoch {epoch+1}/{args.epochs} ===', flush=True)
 
         train_loss, global_step, best_val_loss = train_one_epoch(
@@ -415,6 +431,7 @@ def main():
         save_checkpoint(
             os.path.join(CKPT_DIR, f'{run_name}_last.pth'),
             model, optimiser, scheduler, epoch, best_val_loss, args,
+            global_step=global_step,
         )
 
         if val_loss < best_val_loss:
@@ -422,6 +439,7 @@ def main():
             save_checkpoint(
                 os.path.join(CKPT_DIR, f'{run_name}_best.pth'),
                 model, optimiser, scheduler, epoch, best_val_loss, args,
+                global_step=global_step,
             )
             print(f'  *** New best val loss: {best_val_loss:.4f} ***', flush=True)
 

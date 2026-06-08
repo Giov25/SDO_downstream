@@ -3,8 +3,9 @@
 #SBATCH --partition=gpu
 #SBATCH --qos=debug
 #SBATCH --gres=shard:1
-#SBATCH --output=forecast_train-%j.out
-#SBATCH --error=forecast_train-%j.err
+
+#SBATCH --output=logs/forecast_train-%j.out
+#SBATCH --error=logs/forecast_train-%j.err
 
 cd /home/gpatane/SDO_downstream/forecast_project
 

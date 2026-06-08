@@ -4,7 +4,7 @@
 # Uso: bash submit_chain.sh [N]   (default: 10)
 
 N=${1:-3}
-SBATCH_FILE="$(dirname "$0")/train.sbatch"
+SBATCH_FILE="$(dirname "$0")/train_seg.sbatch"
 
 echo "Submitting chain of $N jobs from $SBATCH_FILE"
 

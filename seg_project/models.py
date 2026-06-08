@@ -1151,6 +1151,165 @@ class MAE_Seg_DeformerV2(nn.Module):
         return mask
 
 
+# ─────────────────────────── Decoder V3 ────────────────────────────────────
+
+class ASPPWithGlobal(nn.Module):
+    """ASPP + global average pooling branch (DeepLab v3+ style).
+
+    Aggiunge un branch con AdaptiveAvgPool che cattura il contesto globale
+    del disco solare — fondamentale quando i sunspot sono rari e piccoli.
+    """
+    def __init__(self, in_ch, out_ch, rates=(1, 6, 12, 18)):
+        super().__init__()
+        self.stages = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=r, dilation=r, bias=False),
+                nn.BatchNorm2d(out_ch),
+                nn.ReLU(inplace=True),
+            ) for r in rates
+        ])
+        self.global_branch = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_ch, out_ch, 1, bias=True),  # no BN: spazio 1×1 incompatibile
+            nn.ReLU(inplace=True),
+        )
+        self.bottleneck = nn.Sequential(
+            nn.Conv2d(out_ch * (len(rates) + 1), out_ch, 1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(0.1),
+        )
+
+    def forward(self, x):
+        size = x.shape[2:]
+        out = [stage(x) for stage in self.stages]
+        g = F.interpolate(self.global_branch(x), size=size, mode='bilinear', align_corners=False)
+        out.append(g)
+        return self.bottleneck(torch.cat(out, dim=1))
+
+
+class SegDeformerUNetDecoderV3(nn.Module):
+    """
+    Decoder V3 — aggiunge al V2:
+      • CoordConv al bottleneck: codifica la latitudine/longitudine solare
+        (i sunspot compaiono preferenzialmente a ±30° dall'equatore).
+      • ASPPWithGlobal: branch GAP per contesto globale del disco solare.
+      • Deep supervision: auxiliary heads a 256×256 e 512×512 che mandano
+        gradiente diretto agli stadi intermedi del decoder.
+    """
+    def __init__(self, num_classes=2, embed_dim=768):
+        super().__init__()
+
+        self.adapter4 = FeatureAdapter(embed_dim)
+        self.adapter3 = FeatureAdapter(embed_dim)
+        self.adapter2 = FeatureAdapter(embed_dim)
+        self.adapter1 = FeatureAdapter(embed_dim)
+
+        # proj4 prende embed_dim + 2 canali coordinate (CoordConv)
+        self.proj4 = nn.Conv2d(embed_dim + 2, 512, 1)
+        self.proj3 = nn.Conv2d(embed_dim, 256, 1)
+        self.proj2 = nn.Conv2d(embed_dim, 128, 1)
+        self.proj1 = nn.Conv2d(embed_dim, 64, 1)
+
+        self.aspp = ASPPWithGlobal(512, 512, rates=(1, 6, 12, 18))
+
+        # Stage 3: bottleneck → ×2
+        self.up1 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(512, 256, 3, padding=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+        )
+        self.dec3 = DoubleConv(512, 256)
+        self.attn3 = SCSEBlock(256)
+        self.aux_head3 = nn.Conv2d(256, num_classes, 1)  # deep supervision
+
+        # Stage 2: ×2
+        self.up2 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(256, 128, 3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+        )
+        self.dec2 = DoubleConv(256, 128)
+        self.attn2 = SCSEBlock(128)
+        self.aux_head2 = nn.Conv2d(128, num_classes, 1)  # deep supervision
+
+        # Stage 1: ×2
+        self.up3 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(128, 64, 3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+        )
+        self.dec1 = DoubleConv(128, 64)
+        self.attn1 = SCSEBlock(64)
+
+        self.final_head = nn.Sequential(
+            nn.Dropout2d(0.1),
+            nn.Conv2d(64, 32, 3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, num_classes, 1),
+        )
+
+    def _add_coord(self, x):
+        """Aggiunge canali coordinate y,x ∈ [-1, 1] — CoordConv."""
+        B, _, H, W = x.shape
+        gy = torch.linspace(-1, 1, H, device=x.device).view(1, 1, H, 1).expand(B, 1, H, W)
+        gx = torch.linspace(-1, 1, W, device=x.device).view(1, 1, 1, W).expand(B, 1, H, W)
+        return torch.cat([x, gy, gx], dim=1)
+
+    def forward(self, features):
+        f1, f2, f3, f4 = features
+
+        # Bottleneck: adapt → CoordConv → proj → ASPP
+        x = self._add_coord(self.adapter4(f4))          # [B, 770, H, W]
+        x = self.proj4(x)                               # [B, 512, H, W]
+        x = self.aspp(x)                                # [B, 512, H, W]
+        x = self.up1(x)                                 # [B, 256, 2H, 2W]
+
+        s3 = F.interpolate(self.proj3(self.adapter3(f3)), size=x.shape[2:],
+                           mode='bilinear', align_corners=False)
+        x = self.attn3(self.dec3(torch.cat([x, s3], dim=1)))
+        aux3 = self.aux_head3(x)                        # deep supervision
+        x = self.up2(x)                                 # [B, 128, 4H, 4W]
+
+        s2 = F.interpolate(self.proj2(self.adapter2(f2)), size=x.shape[2:],
+                           mode='bilinear', align_corners=False)
+        x = self.attn2(self.dec2(torch.cat([x, s2], dim=1)))
+        aux2 = self.aux_head2(x)                        # deep supervision
+        x = self.up3(x)                                 # [B, 64, 8H, 8W]
+
+        s1 = F.interpolate(self.proj1(self.adapter1(f1)), size=x.shape[2:],
+                           mode='bilinear', align_corners=False)
+        x = self.attn1(self.dec1(torch.cat([x, s1], dim=1)))
+        main = self.final_head(x)
+
+        if self.training:
+            return main, aux3, aux2   # deep supervision solo in train
+        return main
+
+
+class MAE_Seg_DeformerV3(nn.Module):
+    def __init__(self, mae_model, num_classes=2):
+        super().__init__()
+        self.encoder = MAEFeatureExtractor(mae_model)
+        self.decoder = SegDeformerUNetDecoderV3(num_classes=num_classes, embed_dim=768)
+
+    def forward(self, x):
+        features = self.encoder(x)
+        out = self.decoder(features)
+        if self.training:
+            main, aux3, aux2 = out
+            if main.shape[-2:] != x.shape[-2:]:
+                main = F.interpolate(main, size=x.shape[-2:], mode='bilinear', align_corners=False)
+            return main, aux3, aux2
+        if out.shape[-2:] != x.shape[-2:]:
+            out = F.interpolate(out, size=x.shape[-2:], mode='bilinear', align_corners=False)
+        return out
+
+
 class MAE_FrozenEncoderSeg(nn.Module):
     """
     Modello MAE di ricostruzione adattato per la segmentazione downstream.
