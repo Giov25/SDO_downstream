@@ -40,7 +40,7 @@ def get_args():
     parser.add_argument('--resume_checkpoints', type=str, default=None,
                         help="Path to checkpoint for resuming training (deprecated, use --checkpoint_path).")
     parser.add_argument('--mae_checkpoint', type=str,
-                        default='/home/gpatane/SDO_downstream/mae_project/checkpoints/checkpoint_epoch55.pth')
+                        default='/home/gpatane/SDO_downstream/mae_project/checkpoints/ch9_1024_p8_normpix/best_model.pth')
     parser.add_argument('--model_path', type=str, default="/home/gpatane/checkpoints/")
     parser.add_argument('--save_plot', type=str,
                         default="/home/gpatane/checkpoints/predictions/pred.png")
@@ -59,7 +59,7 @@ def get_args():
     parser.add_argument('--loss', type=str, choices=['DiceCELoss', 'TwerskyLoss'],
                         default='TwerskyLoss', help="Loss function to use.")
     parser.add_argument('--device', type=str, default="cuda:0")
-    parser.add_argument('--patch_size', type=int, default=16,
+    parser.add_argument('--patch_size', type=int, default=8,
                         help="Patch size for the MAE backbone (must match the pretrained checkpoint).")
 
     return parser.parse_args()
@@ -111,6 +111,7 @@ def setup_model(args, device):
 
     elif model_name == 'MAE_2Channel':
         model = mae_model_channel_masking_9ch_with_temporal_attn(out_chans=2, patch_size=patch_size)
+
 
         # STEP 1: carica SEMPRE i pesi MAE pretrained (encoder backbone)
         if os.path.exists(args.mae_checkpoint):
@@ -238,6 +239,7 @@ def main():
     train_years = list(range(2011, 2021))   # 10 anni invece di 1
     val_years   = list(range(2021, 2022))
     test_years  = list(range(2023, 2026))
+    #test_years  = list(range(2021, 2022))
 
     # ------------------------------------------------------------------
     # TRAIN / RESUME
@@ -251,11 +253,19 @@ def main():
 
         # Determine save/load path before touching WandB so we can recover run_id
         save_path = get_save_path(args.model_path, args.model, args.load_pretrained, args.freeze_encoder)
+        latest_save_path = save_path.replace('.pth', '_latest.pth')
         print(f"💾 Checkpoint path: {save_path}")
+        
+        if args.checkpoint_path:
+            resume_ckpt = args.checkpoint_path
+        elif os.path.exists(latest_save_path):
+            resume_ckpt = latest_save_path
+        else:
+            resume_ckpt = save_path
 
         # ---- Resume: extract metadata from existing checkpoint ----
         if args.mode == 'resume':
-            ckpt_path = args.checkpoint_path or save_path
+            ckpt_path = resume_ckpt
             if os.path.exists(ckpt_path):
                 print(f"Loading checkpoint metadata for resume: {ckpt_path}")
                 ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
@@ -273,22 +283,43 @@ def main():
                 print(f"Warning: checkpoint not found at {ckpt_path}. Starting fresh.")
                 args.mode = 'train'
 
+        # ---- Run ID persistente (sopravvive anche se il checkpoint perde l'id) ----
+        # Stesso prefisso di get_save_path, così Frozen / Finetuning / Scratch
+        # NON condividono lo stesso file run_id (eviti run wandb sovrascritti).
+        if args.load_pretrained and args.freeze_encoder:
+            exp_prefix = "Frozen_"
+        elif args.load_pretrained:
+            exp_prefix = "Finetuning_"
+        else:
+            exp_prefix = "Scratch_"
+        run_id_file = os.path.join(args.model_path,
+                                   f"wandb_run_id_{exp_prefix}{args.model}.txt")
+
+        # priorità: id dal checkpoint -> id dal file -> nuovo run
+        if not wandb_run_id and os.path.exists(run_id_file):
+            with open(run_id_file) as f:
+                wandb_run_id = f.read().strip()
+            if wandb_run_id:
+                print(f"Recovered WandB run id from file: {wandb_run_id}")
+
         # ---- WandB init ----
+        _wandb_settings = wandb.Settings(init_timeout=300)
         if wandb_run_id:
             run = wandb.init(project="seg-sdo", id=wandb_run_id, resume="allow",
-                             config=vars(args))
+                             config=vars(args), settings=_wandb_settings)
             print(f"Resuming WandB run: {run.url}")
         else:
-            run = wandb.init(project="seg-sdo", config=vars(args))
+            run = wandb.init(project="seg-sdo", config=vars(args),
+                             settings=_wandb_settings)
+            os.makedirs(args.model_path, exist_ok=True)
+            with open(run_id_file, 'w') as f:
+                f.write(run.id)
+            print(f"Saved new WandB run id to: {run_id_file}")
             wandb.define_metric("epoch")
             wandb.define_metric("train/*", step_metric="epoch")
             wandb.define_metric("val/*",   step_metric="epoch")
             wandb.define_metric("learning_rate", step_metric="epoch")
             print(f"Starting new WandB run: {run.url}")
-
-        # NOTE: We read hyperparams from wandb.config so sweeps can override them,
-        # but we keep the original args object for non-hyperparameter fields
-        # (mode, paths, etc.) to avoid AttributeError later.
         wcfg = wandb.config
 
         # ---- Datasets ----
@@ -343,7 +374,7 @@ def main():
 
         # ---- Restore full checkpoint state if resuming ----
         if args.mode == 'resume':
-            ckpt_path = args.checkpoint_path or save_path
+            ckpt_path = resume_ckpt
             if os.path.exists(ckpt_path):
                 print("Restoring model / optimizer / scheduler state...")
                 ckpt       = torch.load(ckpt_path, map_location=device, weights_only=False)
@@ -395,9 +426,10 @@ def main():
         if args.checkpoint_path:
             checkpoint_path = args.checkpoint_path
         else:
-            checkpoint_path = os.path.join(
-                args.model_path,
-                f"{args.image_size}_{args.model}.pth"
+            # Fallback: usa lo stesso schema di nomi del salvataggio (Frozen_/Finetuning_/Scratch_)
+            checkpoint_path = get_save_path(
+                args.model_path, args.model,
+                args.load_pretrained, args.freeze_encoder
             )
 
         if not os.path.exists(checkpoint_path):
@@ -414,7 +446,7 @@ def main():
         dice_metric   = DiceMetric(include_background=False, reduction="mean")
         dice_metric_T = DiceMetric(include_background=True,  reduction="mean")
 
-        from utils_2 import run_and_plot_predictions_all_channels
+        from utils_2 import run_and_plot_predictions_all_channels, testing
         run_and_plot_predictions_all_channels(
             model, test_loader, device,
             dice_metric=dice_metric,
@@ -424,7 +456,8 @@ def main():
             use_wandb=False,
             save_path=args.save_plot,
         )
-
-
+        metric_dice, metric_dice_T, metric_iou, metric_iou_T = testing(model, test_loader, device, dice_metric, dice_metric_T)
+        print(f"Test Dice (no background): {metric_dice:.4f}, Test Dice (with background): {metric_dice_T:.4f}")
+        print(f"Test IoU (no background): {metric_iou:.4f}, Test IoU (with background): {metric_iou_T:.4f}")
 if __name__ == "__main__":
     main()

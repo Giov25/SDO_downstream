@@ -26,3 +26,5 @@ echo "✅ Frozen encoder training completed!"
 
 #python prova_script_rapido.py --mode train --load_pretrained --freeze_encoder --model MAE_Seg_Deformer --batch_size 3 --epochs 200 --lr 1e-4
 #--mae_checkpoint /home/gpatane/SDO_downstream/mae_project/checkpoints/checkpoint_epoch55.pth \
+
+

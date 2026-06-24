@@ -190,7 +190,8 @@ def log_predictions_to_wandb(model, test_loader, device, num_images=6, epoch=0, 
                 # Log su wandb
                 wandb.log({
                     f"{phase}_prediction_{images_logged}": wandb.Image(fig),
-                }, step=epoch)
+                    "epoch": epoch,
+                })
                 
                 plt.close(fig)
                 images_logged += 1
@@ -289,7 +290,7 @@ def _forward_to_image(model, data):
     return out
 
 
-def train_one_epoch_mod(model, loader, criterion, optimizer, device, scheduler, max_grad_norm=1.0):
+def train_one_epoch_mod(model, loader, criterion, optimizer, device, scheduler, max_grad_norm=1.0, scaler=None):
     model.train()
     epoch_loss = 0
     step = 0
@@ -298,31 +299,35 @@ def train_one_epoch_mod(model, loader, criterion, optimizer, device, scheduler, 
         data = batch['image'].to(device)
         labels = batch['mask'].to(device)
         optimizer.zero_grad()
-        out = _forward_to_image(model, data)
 
+        # bfloat16 ha range dinamico pari a float32: non va in overflow come float16
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            out = _forward_to_image(model, data)
+
+        # Loss in float32 fuori dall'autocast per evitare NaN
         if isinstance(out, tuple):
-            # Deep supervision: (main, aux3, aux2)
             main, *auxs = out
             target_size = labels.shape[2:]
-            loss = criterion(main, labels)
+            loss = criterion(main.float(), labels)
             aux_weights = [0.4, 0.2]
             for aux, w in zip(auxs, aux_weights[:len(auxs)]):
-                aux_up = F.interpolate(aux, size=target_size, mode='bilinear', align_corners=False)
+                aux_up = F.interpolate(aux.float(), size=target_size, mode='bilinear', align_corners=False)
                 loss = loss + w * criterion(aux_up, labels)
         else:
-            loss = criterion(out, labels)
+            loss = criterion(out.float(), labels)
 
+        if torch.isnan(loss) or torch.isinf(loss):
+            optimizer.zero_grad()
+            continue
         loss.backward()
-
         if max_grad_norm is not None:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-
         optimizer.step()
 
         epoch_loss += loss.item()
         step += 1
 
-    epoch_loss /= step
+    epoch_loss = epoch_loss / step if step > 0 else float('nan')
     return epoch_loss
 
 def train_one_epoch(model, loader, criterion, optimizer, device, scheduler, max_grad_norm=1.0):
@@ -483,34 +488,35 @@ def validate_one_epoch_mod(model, loader, criterion, device, dice_score, post_pr
         for batch in tqdm(loader, desc="Validation"):
             data = batch['image'].to(device)
             labels = batch['mask'].to(device)
-            outputs = _forward_to_image(model, data)
-            loss = criterion(outputs, labels)
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                outputs = _forward_to_image(model, data)
+            loss = criterion(outputs.float(), labels)
             epoch_loss += loss.item()
             if outputs.dim() >= 4 and outputs.shape[1] > 1:
-                probs = torch.softmax(outputs, dim=1)
+                probs = torch.softmax(outputs.float(), dim=1)
                 preds = torch.argmax(probs, dim=1, keepdim=True).float()
-    
+
             for i in range(data.shape[0]):
                 # Get masks: [H, W]
                 gt_mask = labels[i, 0].long()  # [H, W]
                 pred_mask = preds[i, 0].long()  # [H, W]
-                
+
                 # Convert to one-hot: [H, W] -> [H, W, C] -> [C, H, W] -> [1, C, H, W]
                 gt_one_hot = torch.nn.functional.one_hot(gt_mask, num_classes=2).permute(2, 0, 1).unsqueeze(0).float()  # [1, 2, H, W]
                 pred_one_hot = torch.nn.functional.one_hot(pred_mask, num_classes=2).permute(2, 0, 1).unsqueeze(0).float()  # [1, 2, H, W]
-                
+
                 # dice_score: without background (only foreground class)
                 dice_i = dice_score(pred_one_hot, gt_one_hot)  # include_background=False
                 # Replace NaN with 1.0 (perfect score when class is absent in both GT and pred)
                 dice_i = torch.nan_to_num(dice_i, nan=1.0)
                 dice_scores.append(dice_i.mean().item())
-                
+
                 # dice_score_T: with background (both classes)
                 if dice_score_T is not None:
                     dice_T = dice_score_T(pred_one_hot, gt_one_hot)  # include_background=True
                     dice_T = torch.nan_to_num(dice_T, nan=1.0)
                     dice_scores_T.append(dice_T.mean().item())
-            
+
             step += 1
     epoch_loss /= step
     metric = np.mean(dice_scores) if dice_scores else 0.0

@@ -813,6 +813,8 @@ class SCSEBlock(nn.Module):
 
     def forward(self, x):
         return x * self.cSE(x) + x * self.sSE(x)
+
+
 class FeatureAdapter(nn.Module):
     """Un semplice blocco per adattare le feature congelate"""
     def __init__(self, dim, scale=0.1):
